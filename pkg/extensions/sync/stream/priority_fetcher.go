@@ -38,23 +38,47 @@ import (
 // failure degrades to the pre-priority behavior.
 
 const (
-	// maxConcurrentPriorityFetches limits concurrent priority fetches of
-	// blobs that downstream clients are waiting on.
-	maxConcurrentPriorityFetches = 4
-	// maxConcurrentPlatformPrefetches limits concurrent prefetches of the
-	// blobs of a client-resolved platform manifest.
-	maxConcurrentPlatformPrefetches = 2
-	// PriorityFetchHostConcurrency is the per-host request budget the
-	// dedicated upstream client used for priority fetches should be
-	// configured with, so demand fetches and prefetches never starve each
-	// other at the HTTP layer.
-	PriorityFetchHostConcurrency = maxConcurrentPriorityFetches + maxConcurrentPlatformPrefetches
+	// defaultPriorityFetchBudget is the per-host request budget used for the
+	// priority client when the registry does not configure reqConcurrent.
+	defaultPriorityFetchBudget = 6
+	// demandShareDenominator splits a budget between client-demand fetches and
+	// platform prefetches: demand gets (denominator-1)/denominator of it, so the
+	// default budget of 6 yields the historical 4 demand fetches + 2 prefetches.
+	demandShareDenominator = 3
 )
+
+// PriorityFetchLimits splits a per-host request budget into the number of
+// concurrent client-demand fetches and platform prefetches. A budget <= 0 means
+// "unconfigured" and falls back to defaultPriorityFetchBudget. Both limits are
+// at least 1, so a tiny budget still makes progress on either kind of fetch
+// (at the cost of one request above the budget).
+func PriorityFetchLimits(budget int) (int, int) {
+	if budget <= 0 {
+		budget = defaultPriorityFetchBudget
+	}
+
+	demand := budget * (demandShareDenominator - 1) / demandShareDenominator
+	demand = max(demand, 1)
+
+	prefetch := max(budget-demand, 1)
+
+	return demand, prefetch
+}
+
+// PriorityFetchHostBudget returns the per-host request budget the dedicated
+// upstream client used for priority fetches should be configured with, so
+// demand fetches and prefetches never starve each other at the HTTP layer.
+// It is derived from the registry's reqConcurrent (0 when unset).
+func PriorityFetchHostBudget(reqConcurrent int) int64 {
+	demand, prefetch := PriorityFetchLimits(reqConcurrent)
+
+	return int64(demand + prefetch)
+}
 
 // OpenBlobFunc opens an upstream reader for a blob of the given local repo.
 // Implementations resolve the remote repo/reference and must use a client
 // whose per-host budget is independent from the background sync (see
-// PriorityFetchHostConcurrency).
+// PriorityFetchHostBudget).
 type OpenBlobFunc func(ctx context.Context, localRepo string, desc descriptor.Descriptor) (*blob.BReader, error)
 
 // PriorityFetcher downloads individual blobs out-of-band and feeds them into
@@ -74,15 +98,17 @@ type PriorityFetcher struct {
 }
 
 func NewPriorityFetcher(manager Manager, openBlob OpenBlobFunc, timeout time.Duration,
-	logger log.Logger,
+	hostBudget int, logger log.Logger,
 ) *PriorityFetcher {
+	maxDemand, maxPrefetch := PriorityFetchLimits(hostBudget)
+
 	return &PriorityFetcher{
 		manager:     manager,
 		openBlob:    openBlob,
 		timeout:     timeout,
 		logger:      logger,
-		prioritySem: make(chan struct{}, maxConcurrentPriorityFetches),
-		prefetchSem: make(chan struct{}, maxConcurrentPlatformPrefetches),
+		prioritySem: make(chan struct{}, maxDemand),
+		prefetchSem: make(chan struct{}, maxPrefetch),
 		inFlight:    map[string]struct{}{},
 	}
 }

@@ -51,7 +51,7 @@ func TestPriorityFetcher(t *testing.T) {
 			return newTestBReader(blobData[d.Digest.String()]), nil
 		}
 
-		fetcher := NewPriorityFetcher(sm, openBlob, 0, log.NewTestLogger())
+		fetcher := NewPriorityFetcher(sm, openBlob, 0, 0, log.NewTestLogger())
 
 		Convey("PrioritizeBlob fetches an unfed blob and completes its stream", func() {
 			So(sm.prepareActiveStreamForBlob(desc), ShouldBeNil)

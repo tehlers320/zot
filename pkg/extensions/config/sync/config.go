@@ -81,6 +81,11 @@ type RegistryConfig struct {
 	// the upstream negotiates h2, while DisableHTTP2 alone still caps concurrency at ReqConcurrent's
 	// default of 3 connections. To actually open more than 3 parallel connections to an HTTP/2
 	// upstream, raise ReqConcurrent and set DisableHTTP2.
+	//
+	// In streaming mode it also sizes the separate priority fetch client (the out-of-band downloads
+	// of blobs downstream clients are waiting on): that client gets its own per-host budget derived
+	// from this value, split between client-demand fetches and platform prefetches. When unset, the
+	// priority path keeps its own default budget of 6 (4 demand fetches + 2 prefetches).
 	ReqConcurrent *int
 	// ReqPerSec caps the request rate (requests/second) per upstream host, applied independently to the
 	// upstream registry and to each of its mirrors (a per-host cap, not a shared total across hosts).

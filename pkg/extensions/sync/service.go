@@ -1157,9 +1157,10 @@ func newClient(opts syncconf.RegistryConfig, credentials syncconf.CredentialsFil
 	// to be slow for large images.
 	transport.ResponseHeaderTimeout = opts.ResponseHeaderTimeout
 
-	// hostConfig.ReqConcurrent already holds the effective per-host concurrency cap at this point
-	// (regclient's default of 3, from HostNew() above, or opts.ReqConcurrent if it was set).
-	applySyncTransportOptions(transport, opts, hostConfig.ReqConcurrent)
+	// Size the transport from the main host config *after* hostMods ran (hostConfigOpts[0] is the
+	// upstream host): the priority fetch client raises ReqConcurrent through a mod, and the idle
+	// connection pool has to match the budget the client actually runs with, not the pre-mod one.
+	applySyncTransportOptions(transport, opts, hostConfigOpts[0].ReqConcurrent)
 
 	// Use SyncTimeout for overall HTTP client timeout. This is the maximum time for the entire
 	// HTTP request, covering all stages: DialContext (connection establishment), TLSHandshakeTimeout

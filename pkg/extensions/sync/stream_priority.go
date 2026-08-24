@@ -28,6 +28,17 @@ type streamPrioritizer interface {
 	PrefetchManifestBlobsForStream(localRepo string, mfst manifest.Manifest)
 }
 
+// priorityFetchBudget returns the per-host request budget for the priority
+// fetch path, derived from the registry's reqConcurrent (0 when unset, which
+// makes the stream package fall back to its own default).
+func (service *BaseService) priorityFetchBudget() int {
+	if service.config.ReqConcurrent == nil {
+		return 0
+	}
+
+	return *service.config.ReqConcurrent
+}
+
 // initPriorityFetcher creates the priority fetcher for streaming-enabled
 // services. Called from New(); a no-op when streaming is disabled.
 func (service *BaseService) initPriorityFetcher() {
@@ -36,7 +47,8 @@ func (service *BaseService) initPriorityFetcher() {
 	}
 
 	service.priorityFetcher = stream.NewPriorityFetcher(
-		service.streamManager, service.openPriorityBlob, service.GetSyncTimeout(), service.log)
+		service.streamManager, service.openPriorityBlob, service.GetSyncTimeout(),
+		service.priorityFetchBudget(), service.log)
 }
 
 // initPriorityClient (re)builds the dedicated upstream client for priority
@@ -48,9 +60,11 @@ func (service *BaseService) initPriorityClient() error {
 		return nil
 	}
 
+	budget := stream.PriorityFetchHostBudget(service.priorityFetchBudget())
+
 	prioClient, _, err := newClient(service.config, service.credentials, service.log,
 		func(host *config.Host) {
-			host.ReqConcurrent = stream.PriorityFetchHostConcurrency
+			host.ReqConcurrent = budget
 		})
 	if err != nil {
 		service.log.Err(err).Msg("failed to create priority fetch client")
