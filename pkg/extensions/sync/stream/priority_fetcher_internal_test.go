@@ -54,7 +54,7 @@ func TestPriorityFetcher(t *testing.T) {
 		fetcher := NewPriorityFetcher(sm, openBlob, 0, 0, log.NewTestLogger())
 
 		Convey("PrioritizeBlob fetches an unfed blob and completes its stream", func() {
-			So(sm.prepareActiveStreamForBlob(desc), ShouldBeNil)
+			So(sm.prepareActiveStreamForBlob("myrepo:latest", desc), ShouldBeNil)
 			cbr := sm.activeStreams[desc.Digest.String()]
 
 			fetcher.PrioritizeBlob("myrepo", desc.Digest)
@@ -68,7 +68,7 @@ func TestPriorityFetcher(t *testing.T) {
 		})
 
 		Convey("PrioritizeBlob skips blobs already being fed", func() {
-			So(sm.prepareActiveStreamForBlob(desc), ShouldBeNil)
+			So(sm.prepareActiveStreamForBlob("myrepo:latest", desc), ShouldBeNil)
 
 			// The sync hook already claimed this blob.
 			_, err := sm.StreamingBlobReader(newTestBReader(data))
@@ -106,7 +106,7 @@ func TestPriorityFetcher(t *testing.T) {
 				{Digest: configDigest, Size: int64(len(configData)), MediaType: "application/vnd.oci.image.config.v1+json"},
 				{Digest: layerDigest, Size: int64(len(layerData)), MediaType: "application/vnd.oci.image.layer.v1.tar+gzip"},
 			} {
-				So(sm.prepareActiveStreamForBlob(d), ShouldBeNil)
+				So(sm.prepareActiveStreamForBlob("myrepo:latest", d), ShouldBeNil)
 			}
 
 			fetcher.PrefetchManifestBlobs("myrepo", mfst)
@@ -130,7 +130,7 @@ func TestPriorityFetcher(t *testing.T) {
 			// Only the layer has an unfed active stream; the config has none.
 			layerDigest := godigest.FromBytes(layerData)
 			blobData[layerDigest.String()] = layerData
-			So(sm.prepareActiveStreamForBlob(descriptor.Descriptor{
+			So(sm.prepareActiveStreamForBlob("myrepo:latest", descriptor.Descriptor{
 				Digest: layerDigest, Size: int64(len(layerData)), MediaType: "application/octet-stream",
 			}), ShouldBeNil)
 

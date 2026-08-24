@@ -96,8 +96,16 @@ type ChunkingManager struct {
 	streamingRefs map[string]*StreamableManifest
 	// blobInfo holds blobs and their corresponding descriptor.
 	blobInfoMap map[string]descriptor.Descriptor
-	logger      log.Logger
-	streamLock  sync.Mutex
+	// blobOwners maps a blob digest to the set of streaming images
+	// ("repo:reference") that registered it. Stream state is keyed by digest
+	// alone, but the same layer is routinely shared between images — the empty
+	// layer, or a common base layer, across different repos. Without this
+	// reference count the first image to finish syncing would detach the
+	// shared entries and delete their temp files while another image is still
+	// streaming them, making its in-flight clients fail with a 404.
+	blobOwners map[string]map[string]struct{}
+	logger     log.Logger
+	streamLock sync.Mutex
 }
 
 func NewChunkingManager(rootDir string, logger log.Logger) *ChunkingManager {
@@ -108,6 +116,7 @@ func NewChunkingManager(rootDir string, logger log.Logger) *ChunkingManager {
 		activeStreams: map[string]*ChunkedBlobReader{},
 		streamingRefs: map[string]*StreamableManifest{},
 		blobInfoMap:   map[string]descriptor.Descriptor{},
+		blobOwners:    map[string]map[string]struct{}{},
 		logger:        logger,
 	}
 }
@@ -439,25 +448,76 @@ func (sm *ChunkingManager) ClaimBlobStream(reader *blob.BReader) (*blob.BReader,
 	return wrapped, true, nil
 }
 
-func (sm *ChunkingManager) prepareActiveStreamForBlob(desc descriptor.Descriptor) error {
-	_, ok := sm.activeStreams[desc.Digest.String()]
-	if ok {
-		sm.logger.Warn().Str("blob", desc.Digest.String()).Msg("active stream already exists for blob")
+func (sm *ChunkingManager) prepareActiveStreamForBlob(owner string, desc descriptor.Descriptor) error {
+	digest := desc.Digest.String()
+
+	owners, ok := sm.blobOwners[digest]
+	if !ok {
+		owners = map[string]struct{}{}
+		sm.blobOwners[digest] = owners
+	}
+
+	owners[owner] = struct{}{}
+
+	if _, ok := sm.activeStreams[digest]; ok {
+		sm.logger.Debug().Str("blob", digest).Str("owner", owner).Int("owners", len(owners)).
+			Msg("active stream already exists for blob, sharing it with this image")
 
 		return nil
 	}
 
-	sm.logger.Debug().Str("blob", desc.Digest.String()).Msg("adding blob to active stream")
+	sm.logger.Debug().Str("blob", digest).Msg("adding blob to active stream")
 
 	r, err := NewChunkedBlobReader(sm.tempStore.BlobPath(desc.Digest), sm.logger)
 	if err != nil {
+		sm.releaseBlobOwner(digest, owner)
+
 		return err
 	}
 
-	sm.activeStreams[desc.Digest.String()] = r
-	sm.blobInfoMap[desc.Digest.String()] = desc
+	sm.activeStreams[digest] = r
+	sm.blobInfoMap[digest] = desc
 
 	return nil
+}
+
+// releaseBlobOwner drops one image's ownership of a blob stream and reports
+// whether any owner is left. Must be called with streamLock held.
+func (sm *ChunkingManager) releaseBlobOwner(blobDigest, owner string) bool {
+	owners, ok := sm.blobOwners[blobDigest]
+	if !ok {
+		return false
+	}
+
+	delete(owners, owner)
+
+	if len(owners) > 0 {
+		return true
+	}
+
+	delete(sm.blobOwners, blobDigest)
+
+	return false
+}
+
+// releaseOwnedStreams drops the given image's ownership of every blob it
+// registered and tears down the stream entries left without an owner. Used on
+// the failure path of StoreImageForStreaming, where the image never becomes
+// streamable and would otherwise pin shared blobs forever. Must be called with
+// streamLock held.
+func (sm *ChunkingManager) releaseOwnedStreams(owner string) {
+	for digest, owners := range sm.blobOwners {
+		if _, ok := owners[owner]; !ok {
+			continue
+		}
+
+		if sm.releaseBlobOwner(digest, owner) {
+			continue
+		}
+
+		delete(sm.activeStreams, digest)
+		delete(sm.blobInfoMap, digest)
+	}
 }
 
 func (sm *ChunkingManager) StoreImageForStreaming(repo, reference string,
@@ -523,11 +583,12 @@ func (sm *ChunkingManager) prepareManifestAndContentsForStream(repo, reference s
 
 	// pre-load the individual blobs into activeStreams
 	// first, the manifest
-	err := sm.prepareActiveStreamForBlob(manifest.GetDescriptor())
+	err := sm.prepareActiveStreamForBlob(key, manifest.GetDescriptor())
 	if err != nil {
 		sm.logger.Error().Err(err).Str("blob", manifest.GetDescriptor().Digest.String()).
 			Msg("failed to prepare active stream for blob")
 
+		sm.releaseOwnedStreams(key)
 		delete(sm.streamingRefs, key)
 
 		return err
@@ -547,15 +608,17 @@ func (sm *ChunkingManager) prepareManifestAndContentsForStream(repo, reference s
 		sm.logger.Error().Err(err).Str("blob", configDesc.Digest.String()).
 			Msg("failed to get config descriptor from manifest")
 
+		sm.releaseOwnedStreams(key)
 		delete(sm.streamingRefs, key)
 
 		return err
 	}
 
-	err = sm.prepareActiveStreamForBlob(configDesc)
+	err = sm.prepareActiveStreamForBlob(key, configDesc)
 	if err != nil {
 		sm.logger.Error().Err(err).Str("blob", configDesc.Digest.String()).Msg("failed to prepare active stream for blob")
 
+		sm.releaseOwnedStreams(key)
 		delete(sm.streamingRefs, key)
 
 		return err
@@ -566,16 +629,18 @@ func (sm *ChunkingManager) prepareManifestAndContentsForStream(repo, reference s
 	if err != nil {
 		sm.logger.Error().Err(err).Msg("failed to get layers from manifest")
 
+		sm.releaseOwnedStreams(key)
 		delete(sm.streamingRefs, key)
 
 		return err
 	}
 
 	for _, layer := range layers {
-		err = sm.prepareActiveStreamForBlob(layer)
+		err = sm.prepareActiveStreamForBlob(key, layer)
 		if err != nil {
 			sm.logger.Error().Err(err).Str("blob", layer.Digest.String()).Msg("failed to prepare active stream for blob")
 
+			sm.releaseOwnedStreams(key)
 			delete(sm.streamingRefs, key)
 
 			return err
@@ -700,22 +765,24 @@ func (sm *ChunkingManager) AbortStreamingImage(repo, reference string) {
 
 // detachStreams removes all active stream entries belonging to the manifest
 // (and its sub-manifests) from the manager maps and returns the detached
-// readers keyed by blob digest. Shared layers already detached (or already
-// cleaned by another manifest) are skipped. Must be called with streamLock held.
+// readers keyed by blob digest. Layers still owned by another streaming image,
+// and layers already detached (or already cleaned by another manifest), are
+// skipped. Must be called with streamLock held.
 func (sm *ChunkingManager) detachStreams(
 	repo, reference string, manifest *StreamableManifest,
 ) map[string]*ChunkedBlobReader {
 	detached := map[string]*ChunkedBlobReader{}
+	owner := repo + ":" + reference
 
 	manifestMediaType := manifestpkg.GetMediaType(manifest.referenceManifest)
 	switch manifestMediaType {
 	case manifestpkg.MediaTypeOCI1Manifest, manifestpkg.MediaTypeDocker2Manifest:
-		sm.detachManifestStreams(repo, reference, manifest.referenceManifest, detached)
+		sm.detachManifestStreams(repo, reference, owner, manifest.referenceManifest, detached)
 	case manifestpkg.MediaTypeOCI1ManifestList, manifestpkg.MediaTypeDocker2ManifestList:
 		// For multi-arch images, the manifest is actually an index.
 		// The individual manifests inside must be detached as well.
 		for _, subManifest := range manifest.subManifests {
-			sm.detachManifestStreams(repo, reference, subManifest, detached)
+			sm.detachManifestStreams(repo, reference, owner, subManifest, detached)
 		}
 	default:
 		sm.logger.Error().Str("repo", repo).Str("reference", reference).
@@ -728,7 +795,7 @@ func (sm *ChunkingManager) detachStreams(
 // detachManifestStreams detaches an individual manifest and its contents from
 // the stream cache. Must be called with streamLock held.
 func (sm *ChunkingManager) detachManifestStreams(
-	repo, reference string, manifest manifestpkg.Manifest, detached map[string]*ChunkedBlobReader,
+	repo, reference, owner string, manifest manifestpkg.Manifest, detached map[string]*ChunkedBlobReader,
 ) {
 	imager, ok := manifest.(manifestpkg.Imager)
 	if !ok {
@@ -745,7 +812,7 @@ func (sm *ChunkingManager) detachManifestStreams(
 			Msg("failed to get config descriptor from manifest")
 	}
 
-	sm.detachActiveStream(configDesc.Digest.String(), detached)
+	sm.detachActiveStream(owner, configDesc.Digest.String(), detached)
 
 	layers, err := imager.GetLayers()
 	if err != nil {
@@ -753,16 +820,19 @@ func (sm *ChunkingManager) detachManifestStreams(
 	}
 
 	for _, layer := range layers {
-		sm.detachActiveStream(layer.Digest.String(), detached)
+		sm.detachActiveStream(owner, layer.Digest.String(), detached)
 	}
 
 	// finally, the manifest itself
-	sm.detachActiveStream(manifest.GetDescriptor().Digest.String(), detached)
+	sm.detachActiveStream(owner, manifest.GetDescriptor().Digest.String(), detached)
 }
 
 // detachActiveStream removes a single blob's stream entry from the manager
-// maps and records its reader in detached. Must be called with streamLock held.
-func (sm *ChunkingManager) detachActiveStream(blobDigest string, detached map[string]*ChunkedBlobReader) {
+// maps and records its reader in detached. The entry is kept (and not
+// recorded) when another streaming image still owns the same blob, so that
+// image's in-flight clients keep being served. Must be called with streamLock
+// held.
+func (sm *ChunkingManager) detachActiveStream(owner, blobDigest string, detached map[string]*ChunkedBlobReader) {
 	if _, done := detached[blobDigest]; done {
 		return
 	}
@@ -772,6 +842,14 @@ func (sm *ChunkingManager) detachActiveStream(blobDigest string, detached map[st
 		// Stream was already removed (e.g. this is a shared layer already
 		// cleaned by another manifest).
 		sm.logger.Debug().Str("blob", blobDigest).Msg("no active stream found for blob, already cleaned up")
+
+		return
+	}
+
+	if sm.releaseBlobOwner(blobDigest, owner) {
+		sm.logger.Debug().Str("blob", blobDigest).Str("owner", owner).
+			Int("owners", len(sm.blobOwners[blobDigest])).
+			Msg("blob stream is still owned by another streaming image, keeping it")
 
 		return
 	}

@@ -42,6 +42,7 @@ func newTestChunkingManager(dir string) *ChunkingManager {
 		activeStreams: map[string]*ChunkedBlobReader{},
 		streamingRefs: map[string]*StreamableManifest{},
 		blobInfoMap:   map[string]descriptor.Descriptor{},
+		blobOwners:    map[string]map[string]struct{}{},
 		logger:        logger,
 	}
 }
@@ -121,7 +122,7 @@ func TestChunkingManagerConnectClient(t *testing.T) {
 				MediaType: "application/octet-stream",
 			}
 
-			err := sm.prepareActiveStreamForBlob(desc)
+			err := sm.prepareActiveStreamForBlob("repo:latest", desc)
 			So(err, ShouldBeNil)
 
 			copier, err := sm.ConnectClient(desc.Digest.String(), &bytes.Buffer{})
@@ -182,7 +183,7 @@ func TestChunkingManagerStreamingBlobReader(t *testing.T) {
 				MediaType: "application/octet-stream",
 			}
 
-			err := sm.prepareActiveStreamForBlob(desc)
+			err := sm.prepareActiveStreamForBlob("repo:latest", desc)
 			So(err, ShouldBeNil)
 
 			reader := newTestBReader(data)
@@ -200,7 +201,7 @@ func TestChunkingManagerStreamingBlobReader(t *testing.T) {
 			}
 
 			// Prepare the active stream — this creates a ChunkedBlobReader.
-			err := sm.prepareActiveStreamForBlob(desc)
+			err := sm.prepareActiveStreamForBlob("repo:latest", desc)
 			So(err, ShouldBeNil)
 
 			// Simulate complete blob already on disk by writing all data to the temp file.
@@ -251,7 +252,7 @@ func TestChunkingManagerStreamingBlobReader(t *testing.T) {
 			}
 
 			// Prepare the active stream.
-			err := sm.prepareActiveStreamForBlob(desc)
+			err := sm.prepareActiveStreamForBlob("repo:latest", desc)
 			So(err, ShouldBeNil)
 
 			// Write only the prefix to disk (partial download).
@@ -521,7 +522,7 @@ func TestChunkingManagerStreamingBlobReaderRetry(t *testing.T) {
 			MediaType: "application/octet-stream",
 		}
 
-		err := sm.prepareActiveStreamForBlob(desc)
+		err := sm.prepareActiveStreamForBlob("repo:latest", desc)
 		So(err, ShouldBeNil)
 
 		Convey("re-arms a failed reader in place and resumes appending to disk", func() {
@@ -800,7 +801,7 @@ func TestChunkingManagerDuplicateInFlightSync(t *testing.T) {
 			MediaType: "application/octet-stream",
 		}
 
-		So(sm.prepareActiveStreamForBlob(desc), ShouldBeNil)
+		So(sm.prepareActiveStreamForBlob("repo:latest", desc), ShouldBeNil)
 
 		// First sync initializes the chunked reader (primary download).
 		primary, err := sm.StreamingBlobReader(newTestBReader(data))
@@ -917,7 +918,7 @@ func TestChunkingManagerEarlyClientBeforePlanAInit(t *testing.T) {
 		blobPath := sm.tempStore.BlobPath(desc.Digest)
 		So(os.WriteFile(blobPath, data, 0o600), ShouldBeNil)
 
-		So(sm.prepareActiveStreamForBlob(desc), ShouldBeNil)
+		So(sm.prepareActiveStreamForBlob("repo:latest", desc), ShouldBeNil)
 
 		// Client connects while the reader is still uninitialized.
 		var clientBuf bytes.Buffer
@@ -974,7 +975,7 @@ func TestChunkingManagerClaimBlobStream(t *testing.T) {
 		})
 
 		Convey("claims an uninitialized stream and pumps data to disk and clients", func() {
-			So(sm.prepareActiveStreamForBlob(desc), ShouldBeNil)
+			So(sm.prepareActiveStreamForBlob("repo:latest", desc), ShouldBeNil)
 			So(sm.NeedsUpstreamData(desc.Digest.String()), ShouldBeTrue)
 
 			cbr := sm.activeStreams[desc.Digest.String()]
@@ -1009,7 +1010,7 @@ func TestChunkingManagerClaimBlobStream(t *testing.T) {
 		})
 
 		Convey("does not claim a stream already initialized by the sync hook", func() {
-			So(sm.prepareActiveStreamForBlob(desc), ShouldBeNil)
+			So(sm.prepareActiveStreamForBlob("repo:latest", desc), ShouldBeNil)
 
 			hooked, err := sm.StreamingBlobReader(newTestBReader(data))
 			So(err, ShouldBeNil)
@@ -1022,7 +1023,7 @@ func TestChunkingManagerClaimBlobStream(t *testing.T) {
 		})
 
 		Convey("marks an already-complete on-disk blob complete instead of claiming", func() {
-			So(sm.prepareActiveStreamForBlob(desc), ShouldBeNil)
+			So(sm.prepareActiveStreamForBlob("repo:latest", desc), ShouldBeNil)
 
 			// Simulate a complete file left by a previous attempt, then
 			// re-create the chunked reader so it picks up the resume offset.
@@ -1047,7 +1048,7 @@ func TestChunkingManagerClaimBlobStream(t *testing.T) {
 		})
 
 		Convey("does not claim an aborted stream", func() {
-			So(sm.prepareActiveStreamForBlob(desc), ShouldBeNil)
+			So(sm.prepareActiveStreamForBlob("repo:latest", desc), ShouldBeNil)
 			sm.activeStreams[desc.Digest.String()].Abort()
 
 			wrapped, claimed, err := sm.ClaimBlobStream(newTestBReader(data))
@@ -1056,5 +1057,59 @@ func TestChunkingManagerClaimBlobStream(t *testing.T) {
 			So(wrapped, ShouldBeNil)
 			So(sm.NeedsUpstreamData(desc.Digest.String()), ShouldBeFalse)
 		})
+	})
+}
+
+func TestChunkingManagerSharedBlobOwnership(t *testing.T) {
+	Convey("a blob shared by two streaming images survives the first teardown", t, func() {
+		sm := newTestChunkingManager(t.TempDir())
+
+		// Two images in different repos sharing one layer, as the empty layer
+		// or a common base layer is shared across unrelated images.
+		sharedLayer := []byte("shared-layer-payload")
+		firstConfig := []byte("first-config")
+		secondConfig := []byte("second-config")
+
+		first := newTestOCIManifestWithBlobs(t, firstConfig, sharedLayer)
+		second := newTestOCIManifestWithBlobs(t, secondConfig, sharedLayer)
+
+		So(sm.StoreImageForStreaming("repo/first", "latest", NewStreamableManifest(first, nil)), ShouldBeNil)
+		So(sm.StoreImageForStreaming("repo/second", "latest", NewStreamableManifest(second, nil)), ShouldBeNil)
+
+		sharedDigest := godigest.FromBytes(sharedLayer).String()
+		firstConfigDigest := godigest.FromBytes(firstConfig).String()
+		sharedPath := sm.tempStore.BlobPath(godigest.FromBytes(sharedLayer))
+
+		So(sm.blobOwners[sharedDigest], ShouldHaveLength, 2)
+
+		sm.RemoveStreamingImage("repo/first", "latest")
+
+		// The first image's own blobs are torn down.
+		_, hasFirstConfig := sm.activeStreams[firstConfigDigest]
+		So(hasFirstConfig, ShouldBeFalse)
+
+		// The shared layer stays streamable for the second image: dropping it
+		// here would make that image's in-flight clients fail with a 404.
+		_, hasShared := sm.activeStreams[sharedDigest]
+		So(hasShared, ShouldBeTrue)
+		So(sm.blobOwners[sharedDigest], ShouldHaveLength, 1)
+
+		blen, _, err := sm.CachedBlobInfo(sharedDigest)
+		So(err, ShouldBeNil)
+		So(blen, ShouldEqual, int64(len(sharedLayer)))
+
+		// ...and so does its temp file.
+		_, statErr := os.Stat(sharedPath)
+		So(statErr, ShouldBeNil)
+
+		// Once the last owner is done, the entry and the temp file go away.
+		sm.RemoveStreamingImage("repo/second", "latest")
+
+		_, stillShared := sm.activeStreams[sharedDigest]
+		So(stillShared, ShouldBeFalse)
+		So(sm.blobOwners, ShouldBeEmpty)
+
+		_, statErr = os.Stat(sharedPath)
+		So(os.IsNotExist(statErr), ShouldBeTrue)
 	})
 }
