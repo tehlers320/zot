@@ -21,7 +21,7 @@ Please see [documentation](./examples/README.md) for various configuration optio
 | **Delete by tag** | unsupported [4],[5] | yes |
 | **Vulnerability scanning** | none | built-in |
 | **cli** | yes | yes |
-| **ui** | auxiliary [3],[4] | yes [8] |
+| **ui** | auxiliary [6],[7] | yes [8] |
 | **External contributions** | yes | yes |
 | **CNCF project** | yes [9] | no |
 | **dist-spec conformance** | pending 3.x release [10][11] | yes [12] |
@@ -47,7 +47,7 @@ and the possible attack surface.
 
 [7] https://github.com/parabuzzle/craneoperator
 
-[8] https://github.com/project-zot/zot-ui
+[8] https://github.com/project-zot/zui
 
 [9] https://www.docker.com/blog/donating-docker-distribution-to-the-cncf/
 

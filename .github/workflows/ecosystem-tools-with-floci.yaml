@@ -1,4 +1,4 @@
-name: "Ecosystem client tools"
+name: "Ecosystem client tools with floci"
 on:
   push:
     branches:
@@ -12,8 +12,8 @@ on:
 permissions: read-all
 
 jobs:
-  client-tools:
-    name: Check client tools
+  floci-client-tools:
+    name: floci - Check client tools
     runs-on: cncf-ubuntu-32-128-x86
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,7 +74,7 @@ jobs:
       - name: Run CI tests
         run: |
           make run-blackbox-ci
-      - uses: ./.github/actions/setup-localstack
+      - uses: ./.github/actions/setup-floci
       - name: Run cloud-only tests
         run: |
           make run-blackbox-cloud-ci
@@ -98,7 +98,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: zot-scale-out-dynamodb-logs
+          name: zot-scale-out-dynamodb-logs-floci
           path: /tmp/zot-ft-logs
           if-no-files-found: ignore
       - name: DynamoDB multi-hop detection
@@ -136,7 +136,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: zot-scale-out-redis-logs
+          name: zot-scale-out-redis-logs-floci
           path: /tmp/zot-ft-logs
           if-no-files-found: ignore
       - name: Redis multi-hop detection
@@ -161,7 +161,7 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: zb-cloud-scale-out-functional-results-${{ github.sha }}
+          name: zb-cloud-scale-out-functional-results-floci-${{ github.sha }}
           path: ./zb-results/
-      - uses: ./.github/actions/teardown-localstack
+      - uses: ./.github/actions/teardown-floci
         if: always()

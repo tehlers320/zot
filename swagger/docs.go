@@ -634,7 +634,8 @@ const docTemplate = `{
                     "application/json"
                 ],
                 "produces": [
-                    "application/vnd.oci.image.layer.v1.tar+gzip"
+                    "application/json",
+                    "application/octet-stream"
                 ],
                 "summary": "Get image blob/layer",
                 "parameters": [
@@ -699,7 +700,8 @@ const docTemplate = `{
                     "application/json"
                 ],
                 "produces": [
-                    "application/json"
+                    "application/json",
+                    "application/octet-stream"
                 ],
                 "summary": "Check image blob/layer",
                 "parameters": [
