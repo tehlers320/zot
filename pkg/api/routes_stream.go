@@ -87,7 +87,7 @@ func (rh *RouteHandler) tryStreamBlobInfo(repo, digest string, response http.Res
 
 	rh.c.Log.Debug().Str("digest", digest).Msg("checking stream cache for blob existence")
 
-	blobSize, blobMediaType, err := streamer.CachedBlobInfo(digest)
+	blobSize, _, err := streamer.CachedBlobInfo(digest)
 	if err != nil {
 		if errors.Is(err, zerr.ErrBlobNotFound) {
 			rh.c.Log.Debug().Str("digest", digest).Msg("blob not found in stream cache")
@@ -100,7 +100,12 @@ func (rh *RouteHandler) tryStreamBlobInfo(repo, digest string, response http.Res
 
 	response.Header().Set("Content-Length", strconv.FormatInt(blobSize, 10))
 	response.Header().Set("Accept-Ranges", "bytes")
-	response.Header().Set("Content-Type", blobMediaType)
+	// Same Content-Type as CheckBlob answers from storage: blob responses always
+	// advertise application/octet-stream, so a blob does not change media type
+	// depending on whether it is still streaming or already committed. The
+	// stream descriptor's media type is available here for free, but advertising
+	// it would diverge from the non-streaming handlers (see #4350).
+	response.Header().Set("Content-Type", constants.BinaryMediaType)
 	response.Header().Set(constants.DistContentDigestKey, digest)
 	response.WriteHeader(http.StatusOK)
 
@@ -141,7 +146,7 @@ func (rh *RouteHandler) tryServeStreamedBlob(response http.ResponseWriter, reque
 func (rh *RouteHandler) tryStreamBlob(streamer syncStreamer, response http.ResponseWriter, request *http.Request,
 	name string, digest godigest.Digest, contentRange string, rangeHeaderPresent bool,
 ) bool {
-	blobSize, mediaType, err := streamer.CachedBlobInfo(digest.String())
+	blobSize, _, err := streamer.CachedBlobInfo(digest.String())
 	if err != nil {
 		rh.c.Log.Debug().Str("repo", name).Str("digest", digest.String()).
 			Msg("blob not found in active streams")
@@ -187,7 +192,9 @@ func (rh *RouteHandler) tryStreamBlob(streamer syncStreamer, response http.Respo
 	}
 
 	response.Header().Set(constants.DistContentDigestKey, digest.String())
-	response.Header().Set("Content-Type", mediaType)
+	// See tryStreamBlobInfo: blob responses always advertise
+	// application/octet-stream, streaming or not.
+	response.Header().Set("Content-Type", constants.BinaryMediaType)
 	response.Header().Set("Accept-Ranges", "bytes")
 
 	if rangeHeaderPresent {
@@ -223,7 +230,11 @@ func (rh *RouteHandler) serveBlobFromStoreRetry(response http.ResponseWriter, re
 	imgStore storageTypes.ImageStore, name string, digest godigest.Digest,
 	contentRange string, rangeHeaderPresent bool,
 ) bool {
-	mediaType := resolveBlobResponseMediaType(imgStore, name, digest, rh.c.Log)
+	// Blob responses always advertise application/octet-stream, matching the
+	// non-streaming blob handlers (see #4350: resolving the descriptor media
+	// type cost an index walk per request and Content-Type is not specified
+	// for blob pulls).
+	mediaType := constants.BinaryMediaType
 
 	if !rangeHeaderPresent {
 		reader, blen, err := imgStore.GetBlob(name, digest, mediaType)

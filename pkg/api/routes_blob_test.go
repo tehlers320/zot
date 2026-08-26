@@ -372,7 +372,9 @@ func TestGetBlobStreaming(t *testing.T) {
 
 			So(resp.StatusCode, ShouldEqual, http.StatusOK)
 			So(resp.Header.Get("Content-Length"), ShouldEqual, strconv.Itoa(len(blobData)))
-			So(resp.Header.Get("Content-Type"), ShouldEqual, blobMediaType)
+			// The stream reports the layer media type, but blob responses always
+			// advertise application/octet-stream, streaming or not.
+			So(resp.Header.Get("Content-Type"), ShouldEqual, constants.BinaryMediaType)
 			So(resp.Header.Get(constants.DistContentDigestKey), ShouldEqual, blobDigest.String())
 
 			respBody, readErr := io.ReadAll(resp.Body)
@@ -446,7 +448,9 @@ func TestGetBlobStreaming(t *testing.T) {
 			// Status 200 was written before Copy() ran; the handler cannot change it.
 			So(resp.StatusCode, ShouldEqual, http.StatusOK)
 			So(resp.Header.Get(constants.DistContentDigestKey), ShouldEqual, blobDigest.String())
-			So(resp.Header.Get("Content-Type"), ShouldEqual, blobMediaType)
+			// The stream reports the layer media type, but blob responses always
+			// advertise application/octet-stream, streaming or not.
+			So(resp.Header.Get("Content-Type"), ShouldEqual, constants.BinaryMediaType)
 
 			respBody, readErr := io.ReadAll(resp.Body)
 			So(readErr, ShouldBeNil)
@@ -646,7 +650,9 @@ func TestCheckBlobStreaming(t *testing.T) {
 			So(resp.StatusCode, ShouldEqual, http.StatusOK)
 			So(resp.Header.Get("Content-Length"), ShouldEqual, strconv.FormatInt(blobSize, 10))
 			So(resp.Header.Get("Accept-Ranges"), ShouldEqual, "bytes")
-			So(resp.Header.Get("Content-Type"), ShouldEqual, blobMediaType)
+			// The stream reports the layer media type, but blob responses always
+			// advertise application/octet-stream, streaming or not.
+			So(resp.Header.Get("Content-Type"), ShouldEqual, constants.BinaryMediaType)
 			So(resp.Header.Get(constants.DistContentDigestKey), ShouldEqual, blobDigestStr)
 		})
 
@@ -676,7 +682,9 @@ func TestCheckBlobStreaming(t *testing.T) {
 			So(resp.StatusCode, ShouldEqual, http.StatusOK)
 			So(resp.Header.Get("Content-Length"), ShouldEqual, strconv.FormatInt(blobSize, 10))
 			So(resp.Header.Get("Accept-Ranges"), ShouldEqual, "bytes")
-			So(resp.Header.Get("Content-Type"), ShouldEqual, blobMediaType)
+			// The stream reports the layer media type, but blob responses always
+			// advertise application/octet-stream, streaming or not.
+			So(resp.Header.Get("Content-Type"), ShouldEqual, constants.BinaryMediaType)
 			So(resp.Header.Get(constants.DistContentDigestKey), ShouldEqual, blobDigestStr)
 		})
 
