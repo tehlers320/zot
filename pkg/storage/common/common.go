@@ -816,6 +816,16 @@ func GetReferrers(imgStore storageTypes.ImageStore, repo string, gdigest godiges
 
 	index, err := GetIndex(imgStore, repo, log)
 	if err != nil {
+		// A repo dir without a readable index.json is not a served repo (yet):
+		// an on-demand streaming sync that has not committed the image, an
+		// interrupted initRepo, or - on object storage, where DirExists is a
+		// prefix lookup - a prefix that only matches a sibling repo. Referrers
+		// of an unknown repo are an empty list, same as for a missing dir above;
+		// a 500 here breaks client pulls, which always probe referrers.
+		if errors.Is(err, zerr.ErrRepoNotFound) {
+			return newEmptyReferrersIndex(), nil
+		}
+
 		return nilIndex, err
 	}
 
