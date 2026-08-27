@@ -224,4 +224,5 @@ var (
 	ErrSyncUpstreamDownloadFailed       = errors.New("upstream blob download failed")
 	ErrSyncInvalidManifestMediaType     = errors.New("invalid manifest mediatype")
 	ErrSyncFailedToPrepareManifest      = errors.New("failed to prepare manifest for stream")
+	ErrSyncManifestUpToDate             = errors.New("local manifest matches upstream, nothing to sync")
 )

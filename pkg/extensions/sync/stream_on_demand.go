@@ -4,6 +4,7 @@ package sync
 
 import (
 	"context"
+	"errors"
 	"io"
 
 	godigest "github.com/opencontainers/go-digest"
@@ -74,6 +75,13 @@ func (onDemand *BaseOnDemand) ConnectBlobStream(repo, blobDigest string, writer 
 	return copier.CopyRange, nil
 }
 
+// streamRepoInitializer is implemented by streaming services that can create
+// the local repo layout up front. Like streamPrioritizer it is discovered via a
+// type assertion, so the Service interface stays unaware of streaming details.
+type streamRepoInitializer interface {
+	EnsureLocalRepo(ctx context.Context, repo string) error
+}
+
 // streamPrioritizerFor returns the first streaming-enabled service for the
 // repo that supports priority fetching, or nil when there is none.
 func (onDemand *BaseOnDemand) streamPrioritizerFor(repo string) streamPrioritizer {
@@ -108,6 +116,26 @@ func (onDemand *BaseOnDemand) prioritizeStreamedBlob(repo, blobDigest string) {
 	}
 }
 
+// ensureLocalRepoForStream creates the local repo layout for a repo whose image
+// is about to be streamed, so that clients which follow up the manifest with a
+// referrers (or tags) lookup do not hit a repo without an index.json.
+func (onDemand *BaseOnDemand) ensureLocalRepoForStream(ctx context.Context, repo string) error {
+	for _, service := range onDemand.services {
+		if !service.IsStreamingForRepo(repo) {
+			continue
+		}
+
+		initializer, ok := service.(streamRepoInitializer)
+		if !ok {
+			continue
+		}
+
+		return initializer.EnsureLocalRepo(ctx, repo)
+	}
+
+	return nil
+}
+
 // FetchManifestForStream directly fetches the manifest from the upstream
 // services, prepares the image for streaming and kicks off the actual sync in
 // the background. It returns the raw manifest content so the API layer does
@@ -135,10 +163,37 @@ func (onDemand *BaseOnDemand) FetchManifestForStream(
 
 	var subManifestsInManifest []manifest.Manifest
 
+	// Creating the local repo layout and fetching the manifest from upstream are
+	// independent, so overlap them. The layout has to exist before the manifest
+	// is served (see ensureLocalRepoForStream), but doing it after the upstream
+	// round trip would add its latency - a few writes locally, HEAD/LIST plus
+	// PUT calls on object storage - to the client's first response.
+	initDone := make(chan error, 1)
+
+	go func() {
+		initDone <- onDemand.ensureLocalRepoForStream(ctx, repo)
+	}()
+
 	for _, service := range onDemand.services {
 		onDemand.log.Debug().Str("repo", repo).Str("ref", reference).Msg("attempting to fetch manifest")
 		fetchedManifest, subManifests, err := service.FetchManifest(ctx, repo, reference)
 		if err != nil {
+			// The upstream check confirmed the local copy is current: there is
+			// nothing to stream, and the caller serves the manifest from storage.
+			if errors.Is(err, zerr.ErrSyncManifestUpToDate) {
+				return nil, "", "", err
+			}
+
+			// A registry whose content rules do not cover this repo is not an
+			// error: with several upstreams configured, every request walks past
+			// the ones that do not serve it before reaching the one that does.
+			if errors.Is(err, zerr.ErrSyncImageFilteredOut) {
+				onDemand.log.Debug().Str("repo", repo).Str("ref", reference).
+					Msg("service does not serve this repo, trying the next one")
+
+				continue
+			}
+
 			onDemand.log.Error().Err(err).Msg("failed to fetch manifest from service")
 
 			continue
@@ -155,6 +210,19 @@ func (onDemand *BaseOnDemand) FetchManifestForStream(
 
 	onDemand.log.Debug().Str("repo", repo).Str("reference", reference).
 		Msg("storing image for streaming")
+
+	// The manifest is about to be served from upstream while the image is still
+	// syncing, so the repo has to be readable locally first: a client that
+	// follows up with a referrers lookup must not be told a repo it just pulled
+	// a manifest from is broken. A local store we cannot write to would fail the
+	// background sync anyway, so refuse the fast path instead of serving a
+	// manifest whose blobs will never arrive.
+	if err := <-initDone; err != nil {
+		onDemand.log.Error().Err(err).Str("repo", repo).Str("reference", reference).
+			Msg("failed to initialize local repo for streaming")
+
+		return nil, "", "", err
+	}
 
 	streamableManifest := stream.NewStreamableManifest(resultManifest, subManifestsInManifest)
 

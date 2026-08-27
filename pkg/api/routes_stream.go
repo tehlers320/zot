@@ -306,8 +306,16 @@ func (rh *RouteHandler) streamedManifestFastPath(ctx context.Context, imgStore s
 
 	content, digest, mediaType, err = streamer.FetchManifestForStream(ctx, name, reference)
 	if err != nil {
-		rh.c.Log.Err(err).Str("repository", name).Str("reference", reference).
-			Msg("failed to fetch manifest for stream")
+		// An up-to-date local copy is the expected outcome of the upstream check
+		// for an unchanged tag, not a failure: nothing was streamed and the
+		// manifest below comes straight from storage.
+		if errors.Is(err, zerr.ErrSyncManifestUpToDate) {
+			rh.c.Log.Debug().Str("repository", name).Str("reference", reference).
+				Msg("local manifest is up to date with upstream, serving it from storage")
+		} else {
+			rh.c.Log.Err(err).Str("repository", name).Str("reference", reference).
+				Msg("failed to fetch manifest for stream")
+		}
 
 		content, digest, mediaType, err = imgStore.GetImageManifest(name, reference)
 

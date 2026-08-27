@@ -3509,3 +3509,480 @@ func TestOnDemandShouldCheckUpstreamManifest(t *testing.T) {
 		So(onDemand.ShouldCheckUpstreamManifest("repo", "latest"), ShouldBeTrue)
 	})
 }
+
+// mockStreamingService is a streaming-enabled service that can also initialize
+// the local repo, i.e. it satisfies streamRepoInitializer.
+type mockStreamingService struct {
+	*mockSyncService
+
+	ensureLocalRepoFn func(ctx context.Context, repo string) error
+	ensuredRepos      []string
+}
+
+func (s *mockStreamingService) EnsureLocalRepo(ctx context.Context, repo string) error {
+	s.ensuredRepos = append(s.ensuredRepos, repo)
+
+	if s.ensureLocalRepoFn != nil {
+		return s.ensureLocalRepoFn(ctx, repo)
+	}
+
+	return nil
+}
+
+func TestBaseServiceEnsureLocalRepo(t *testing.T) {
+	Convey("EnsureLocalRepo makes a repo readable before its image is committed", t, func() {
+		const repo = "test/streamed"
+
+		rootDir := t.TempDir()
+		imgStore := local.NewImageStore(rootDir, false, false, log.NewTestLogger(),
+			monitoring.NewNopMetricServer(), nil, nil, nil, nil)
+
+		service := &BaseService{
+			storeController: storage.StoreController{DefaultStore: imgStore},
+			log:             log.NewTestLogger(),
+		}
+
+		// A repo whose dir does not exist at all is already answered as empty.
+		_, err := imgStore.GetReferrers(repo, godigest.FromString("subject"), nil)
+		So(err, ShouldBeNil)
+
+		So(service.EnsureLocalRepo(context.Background(), repo), ShouldBeNil)
+
+		indexContent, err := os.ReadFile(path.Join(rootDir, repo, ispec.ImageIndexFile))
+		So(err, ShouldBeNil)
+
+		var index ispec.Index
+		So(json.Unmarshal(indexContent, &index), ShouldBeNil)
+		So(index.Manifests, ShouldBeEmpty)
+
+		// No tag or manifest was made visible by initializing the repo.
+		_, _, _, err = imgStore.GetImageManifest(repo, "latest")
+		So(errors.Is(err, zerr.ErrManifestNotFound), ShouldBeTrue)
+
+		referrers, err := imgStore.GetReferrers(repo, godigest.FromString("subject"), nil)
+		So(err, ShouldBeNil)
+		So(referrers.Manifests, ShouldBeEmpty)
+	})
+
+	Convey("EnsureLocalRepo is idempotent and keeps an existing index untouched", t, func() {
+		const repo = "test/streamed"
+
+		rootDir := t.TempDir()
+		imgStore := local.NewImageStore(rootDir, false, false, log.NewTestLogger(),
+			monitoring.NewNopMetricServer(), nil, nil, nil, nil)
+
+		service := &BaseService{
+			storeController: storage.StoreController{DefaultStore: imgStore},
+			log:             log.NewTestLogger(),
+		}
+
+		So(service.EnsureLocalRepo(context.Background(), repo), ShouldBeNil)
+
+		first, err := os.ReadFile(path.Join(rootDir, repo, ispec.ImageIndexFile))
+		So(err, ShouldBeNil)
+
+		So(service.EnsureLocalRepo(context.Background(), repo), ShouldBeNil)
+
+		second, err := os.ReadFile(path.Join(rootDir, repo, ispec.ImageIndexFile))
+		So(err, ShouldBeNil)
+		So(second, ShouldResemble, first)
+	})
+
+	Convey("EnsureLocalRepo rejects an invalid repo name", t, func() {
+		rootDir := t.TempDir()
+		imgStore := local.NewImageStore(rootDir, false, false, log.NewTestLogger(),
+			monitoring.NewNopMetricServer(), nil, nil, nil, nil)
+
+		service := &BaseService{
+			storeController: storage.StoreController{DefaultStore: imgStore},
+			log:             log.NewTestLogger(),
+		}
+
+		err := service.EnsureLocalRepo(context.Background(), "Invalid Repo")
+		So(errors.Is(err, zerr.ErrInvalidRepositoryName), ShouldBeTrue)
+	})
+}
+
+func TestOnDemandFetchManifestForStreamInitializesLocalRepo(t *testing.T) {
+	Convey("The local repo is initialized before a streamed manifest is served", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		fetched := newTestManifest(t)
+
+		storeCalled := false
+		sm := &mockStreamManager{
+			streamingImageManifestFn: func(_, _ string) (*stream.StreamableManifest, bool) {
+				return nil, false
+			},
+			storeImageForStreamingFn: func(_, _ string, _ *stream.StreamableManifest) error {
+				storeCalled = true
+
+				return nil
+			},
+		}
+		onDemand.SetStreamManager(sm)
+
+		svc := &mockStreamingService{
+			mockSyncService: &mockSyncService{
+				fetchManifestFn: func(_ context.Context, _, _ string) (rcManifest.Manifest, []rcManifest.Manifest, error) {
+					return fetched, nil, nil
+				},
+				isStreamingForRepoFn: func(_ string) bool { return true },
+				getSyncTimeoutFn:     func() time.Duration { return 5 * time.Second },
+			},
+		}
+		onDemand.Add(svc)
+
+		result, _, _, err := onDemand.FetchManifestForStream(context.Background(), "myrepo", "latest")
+		So(err, ShouldBeNil)
+		So(result, ShouldNotBeNil)
+		So(svc.ensuredRepos, ShouldResemble, []string{"myrepo"})
+		So(storeCalled, ShouldBeTrue)
+	})
+
+	Convey("A local store that cannot be initialized fails the fast path", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		fetched := newTestManifest(t)
+
+		storeCalled := false
+		sm := &mockStreamManager{
+			streamingImageManifestFn: func(_, _ string) (*stream.StreamableManifest, bool) {
+				return nil, false
+			},
+			storeImageForStreamingFn: func(_, _ string, _ *stream.StreamableManifest) error {
+				storeCalled = true
+
+				return nil
+			},
+		}
+		onDemand.SetStreamManager(sm)
+
+		svc := &mockStreamingService{
+			mockSyncService: &mockSyncService{
+				fetchManifestFn: func(_ context.Context, _, _ string) (rcManifest.Manifest, []rcManifest.Manifest, error) {
+					return fetched, nil, nil
+				},
+				isStreamingForRepoFn: func(_ string) bool { return true },
+				getSyncTimeoutFn:     func() time.Duration { return 5 * time.Second },
+			},
+			ensureLocalRepoFn: func(_ context.Context, _ string) error { return zerr.ErrInvalidRepositoryName },
+		}
+		onDemand.Add(svc)
+
+		result, _, _, err := onDemand.FetchManifestForStream(context.Background(), "myrepo", "latest")
+		So(errors.Is(err, zerr.ErrInvalidRepositoryName), ShouldBeTrue)
+		So(result, ShouldBeNil)
+		// the image must not be announced as streaming when it cannot be stored locally
+		So(storeCalled, ShouldBeFalse)
+	})
+
+	Convey("Services that do not stream the repo are not asked to initialize it", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		fetched := newTestManifest(t)
+
+		sm := &mockStreamManager{
+			streamingImageManifestFn: func(_, _ string) (*stream.StreamableManifest, bool) {
+				return nil, false
+			},
+		}
+		onDemand.SetStreamManager(sm)
+
+		svc := &mockStreamingService{
+			mockSyncService: &mockSyncService{
+				fetchManifestFn: func(_ context.Context, _, _ string) (rcManifest.Manifest, []rcManifest.Manifest, error) {
+					return fetched, nil, nil
+				},
+				isStreamingForRepoFn: func(_ string) bool { return false },
+				getSyncTimeoutFn:     func() time.Duration { return 5 * time.Second },
+			},
+		}
+		onDemand.Add(svc)
+
+		_, _, _, err := onDemand.FetchManifestForStream(context.Background(), "myrepo", "latest")
+		So(err, ShouldBeNil)
+		So(svc.ensuredRepos, ShouldBeEmpty)
+	})
+}
+
+// newUpToDateTestService builds a BaseService talking to url with a local store rooted at rootDir.
+func newUpToDateTestService(t *testing.T, url, rootDir string, reqConcurrent *int) *BaseService {
+	t.Helper()
+
+	imgStore := local.NewImageStore(rootDir, false, false, log.NewTestLogger(),
+		monitoring.NewNopMetricServer(), nil, nil, nil, nil)
+
+	service, err := New(syncconf.RegistryConfig{
+		URLs:                  []string{url},
+		ReqConcurrent:         reqConcurrent,
+		ManifestCheckInterval: time.Hour,
+	}, "", nil, t.TempDir(), storage.StoreController{DefaultStore: imgStore},
+		nil, mocks.MetaDBMock{}, log.NewTestLogger())
+	if err != nil {
+		t.Fatalf("failed to create sync service: %v", err)
+	}
+
+	return service
+}
+
+func TestBaseServiceFetchManifestSkipsUnchangedUpstream(t *testing.T) {
+	const repo = "library/alpine"
+
+	Convey("FetchManifest compares the upstream digest before pulling anything", t, func() {
+		image := CreateRandomImage()
+
+		manifestBlob, err := json.Marshal(image.Manifest)
+		So(err, ShouldBeNil)
+
+		var headDigest string
+		var headCalls, getCalls int32
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/v2/" || r.URL.Path == "/v2":
+				w.WriteHeader(http.StatusOK)
+			case r.URL.Path == "/v2/"+repo+"/manifests/latest" && r.Method == http.MethodHead:
+				atomic.AddInt32(&headCalls, 1)
+
+				if headDigest != "" {
+					w.Header().Set("Docker-Content-Digest", headDigest)
+				}
+
+				w.Header().Set("Content-Type", ispec.MediaTypeImageManifest)
+				w.Header().Set("Content-Length", strconv.Itoa(len(manifestBlob)))
+				w.WriteHeader(http.StatusOK)
+			case r.URL.Path == "/v2/"+repo+"/manifests/latest":
+				atomic.AddInt32(&getCalls, 1)
+
+				w.Header().Set("Docker-Content-Digest", image.DigestStr())
+				w.Header().Set("Content-Type", ispec.MediaTypeImageManifest)
+				_, _ = w.Write(manifestBlob)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		Convey("an unchanged tag is answered without fetching the manifest", func() {
+			headDigest = image.DigestStr()
+
+			service := newUpToDateTestService(t, server.URL, t.TempDir(), nil)
+			So(WriteImageToFileSystem(image, repo, "latest", storage.StoreController{
+				DefaultStore: service.storeController.DefaultStore,
+			}), ShouldBeNil)
+
+			mfst, children, err := service.FetchManifest(context.Background(), repo, "latest")
+			So(errors.Is(err, zerr.ErrSyncManifestUpToDate), ShouldBeTrue)
+			So(mfst, ShouldBeNil)
+			So(children, ShouldBeEmpty)
+			So(atomic.LoadInt32(&headCalls), ShouldEqual, 1)
+			So(atomic.LoadInt32(&getCalls), ShouldEqual, 0)
+
+			Convey("and the check is recorded so the next request stays local", func() {
+				So(service.ShouldCheckUpstream(repo, "latest"), ShouldBeFalse)
+			})
+		})
+	})
+}
+
+func TestBaseServiceFetchManifestFallsBackToFullFetch(t *testing.T) {
+	const repo = "library/alpine"
+
+	newUpstream := func(image Image, headDigest *string, headCalls, getCalls *int32) *httptest.Server {
+		manifestBlob, err := json.Marshal(image.Manifest)
+		if err != nil {
+			t.Fatalf("failed to marshal manifest: %v", err)
+		}
+
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == "/v2/" || r.URL.Path == "/v2":
+				w.WriteHeader(http.StatusOK)
+			case r.URL.Path == "/v2/"+repo+"/manifests/latest" && r.Method == http.MethodHead:
+				atomic.AddInt32(headCalls, 1)
+
+				if *headDigest != "" {
+					w.Header().Set("Docker-Content-Digest", *headDigest)
+				}
+
+				w.Header().Set("Content-Type", ispec.MediaTypeImageManifest)
+				w.Header().Set("Content-Length", strconv.Itoa(len(manifestBlob)))
+				w.WriteHeader(http.StatusOK)
+			case r.URL.Path == "/v2/"+repo+"/manifests/latest":
+				atomic.AddInt32(getCalls, 1)
+
+				w.Header().Set("Docker-Content-Digest", image.DigestStr())
+				w.Header().Set("Content-Type", ispec.MediaTypeImageManifest)
+				_, _ = w.Write(manifestBlob)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+	}
+
+	Convey("An upstream that omits Docker-Content-Digest on HEAD is fetched in full", t, func() {
+		image := CreateRandomImage()
+
+		var headCalls, getCalls int32
+
+		headDigest := ""
+
+		server := newUpstream(image, &headDigest, &headCalls, &getCalls)
+		defer server.Close()
+
+		service := newUpToDateTestService(t, server.URL, t.TempDir(), nil)
+		So(WriteImageToFileSystem(image, repo, "latest", storage.StoreController{
+			DefaultStore: service.storeController.DefaultStore,
+		}), ShouldBeNil)
+
+		mfst, _, err := service.FetchManifest(context.Background(), repo, "latest")
+		So(err, ShouldBeNil)
+		So(mfst, ShouldNotBeNil)
+		So(atomic.LoadInt32(&getCalls), ShouldEqual, 1)
+	})
+
+	Convey("A changed upstream digest is fetched in full", t, func() {
+		image := CreateRandomImage()
+		other := CreateRandomImage()
+
+		var headCalls, getCalls int32
+
+		headDigest := other.DigestStr()
+
+		server := newUpstream(image, &headDigest, &headCalls, &getCalls)
+		defer server.Close()
+
+		service := newUpToDateTestService(t, server.URL, t.TempDir(), nil)
+		So(WriteImageToFileSystem(image, repo, "latest", storage.StoreController{
+			DefaultStore: service.storeController.DefaultStore,
+		}), ShouldBeNil)
+
+		mfst, _, err := service.FetchManifest(context.Background(), repo, "latest")
+		So(err, ShouldBeNil)
+		So(mfst, ShouldNotBeNil)
+		So(atomic.LoadInt32(&headCalls), ShouldEqual, 1)
+		So(atomic.LoadInt32(&getCalls), ShouldEqual, 1)
+	})
+
+	Convey("A locally present digest reference needs no upstream request at all", t, func() {
+		image := CreateRandomImage()
+
+		var headCalls, getCalls int32
+
+		headDigest := image.DigestStr()
+
+		server := newUpstream(image, &headDigest, &headCalls, &getCalls)
+		defer server.Close()
+
+		service := newUpToDateTestService(t, server.URL, t.TempDir(), nil)
+		So(WriteImageToFileSystem(image, repo, image.DigestStr(), storage.StoreController{
+			DefaultStore: service.storeController.DefaultStore,
+		}), ShouldBeNil)
+
+		_, _, err := service.FetchManifest(context.Background(), repo, image.DigestStr())
+		So(errors.Is(err, zerr.ErrSyncManifestUpToDate), ShouldBeTrue)
+		So(atomic.LoadInt32(&headCalls), ShouldEqual, 0)
+		So(atomic.LoadInt32(&getCalls), ShouldEqual, 0)
+	})
+
+	Convey("A repo missing locally is fetched in full without a HEAD probe", t, func() {
+		image := CreateRandomImage()
+
+		var headCalls, getCalls int32
+
+		headDigest := image.DigestStr()
+
+		server := newUpstream(image, &headDigest, &headCalls, &getCalls)
+		defer server.Close()
+
+		service := newUpToDateTestService(t, server.URL, t.TempDir(), nil)
+
+		mfst, _, err := service.FetchManifest(context.Background(), repo, "latest")
+		So(err, ShouldBeNil)
+		So(mfst, ShouldNotBeNil)
+		So(atomic.LoadInt32(&headCalls), ShouldEqual, 0)
+		So(atomic.LoadInt32(&getCalls), ShouldEqual, 1)
+	})
+}
+
+func TestBaseServiceFetchManifestFetchesChildrenConcurrently(t *testing.T) {
+	const repo = "library/alpine"
+	const childDelay = 150 * time.Millisecond
+
+	Convey("The children of an index are fetched in parallel", t, func() {
+		multiarch := CreateRandomMultiarch()
+
+		indexBlob, err := json.Marshal(multiarch.Index)
+		So(err, ShouldBeNil)
+		So(multiarch.Images, ShouldNotBeEmpty)
+
+		childBlobs := map[string][]byte{}
+		for _, child := range multiarch.Images {
+			blob, err := json.Marshal(child.Manifest)
+			So(err, ShouldBeNil)
+			childBlobs[child.DigestStr()] = blob
+		}
+
+		var inFlight, maxInFlight int32
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/v2/" || r.URL.Path == "/v2" {
+				w.WriteHeader(http.StatusOK)
+
+				return
+			}
+
+			reference := strings.TrimPrefix(r.URL.Path, "/v2/"+repo+"/manifests/")
+
+			if reference == "latest" {
+				w.Header().Set("Docker-Content-Digest", multiarch.DigestStr())
+				w.Header().Set("Content-Type", ispec.MediaTypeImageIndex)
+				_, _ = w.Write(indexBlob)
+
+				return
+			}
+
+			blob, ok := childBlobs[reference]
+			if !ok {
+				http.NotFound(w, r)
+
+				return
+			}
+
+			current := atomic.AddInt32(&inFlight, 1)
+			for {
+				observed := atomic.LoadInt32(&maxInFlight)
+				if current <= observed || atomic.CompareAndSwapInt32(&maxInFlight, observed, current) {
+					break
+				}
+			}
+
+			time.Sleep(childDelay)
+			atomic.AddInt32(&inFlight, -1)
+
+			w.Header().Set("Docker-Content-Digest", reference)
+			w.Header().Set("Content-Type", ispec.MediaTypeImageManifest)
+			_, _ = w.Write(blob)
+		}))
+		defer server.Close()
+
+		concurrency := len(multiarch.Images)
+		service := newUpToDateTestService(t, server.URL, t.TempDir(), &concurrency)
+
+		start := time.Now()
+		mfst, children, err := service.FetchManifest(context.Background(), repo, "latest")
+		elapsed := time.Since(start)
+
+		So(err, ShouldBeNil)
+		So(mfst, ShouldNotBeNil)
+		So(children, ShouldHaveLength, len(multiarch.Images))
+
+		// children keep the order of the index descriptors
+		for i, child := range children {
+			So(child, ShouldNotBeNil)
+			So(child.GetDescriptor().Digest, ShouldEqual, multiarch.Index.Manifests[i].Digest)
+		}
+
+		So(atomic.LoadInt32(&maxInFlight), ShouldBeGreaterThan, int32(1))
+		// serial fetching would take at least one delay per child
+		So(elapsed, ShouldBeLessThan, time.Duration(len(multiarch.Images))*childDelay)
+	})
+}
