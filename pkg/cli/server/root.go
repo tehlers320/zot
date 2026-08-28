@@ -1747,6 +1747,30 @@ func validateRegistryManifestCheckInterval(regCfg syncconf.RegistryConfig) error
 	return nil
 }
 
+func validateRegistryStreamingSyncConfig(regCfg syncconf.RegistryConfig) error {
+	if regCfg.IsStreamEnabled() {
+		msgs := []string{}
+
+		if !regCfg.OnDemand {
+			msgs = append(msgs, "streaming sync requires onDemand to be enabled")
+		}
+
+		if regCfg.MaxRetries != nil {
+			msgs = append(msgs, "maxRetries cannot be used when streaming sync is enabled")
+		}
+
+		if regCfg.RetryDelay != nil {
+			msgs = append(msgs, "retryDelay cannot be used when streaming sync is enabled")
+		}
+
+		if len(msgs) != 0 {
+			return fmt.Errorf("%w: %s", zerr.ErrBadConfig, strings.Join(msgs, ","))
+		}
+	}
+
+	return nil
+}
+
 func validateSync(config *config.Config, logger zlog.Logger) error {
 	// check glob patterns in sync config are compilable
 	extensionsConfig := config.CopyExtensionsConfig()
@@ -1765,6 +1789,13 @@ func validateSync(config *config.Config, logger zlog.Logger) error {
 }
 
 func validateSyncRegistry(config *config.Config, regID int, regCfg syncconf.RegistryConfig, logger zlog.Logger) error {
+	if streamValidationErr := validateRegistryStreamingSyncConfig(regCfg); streamValidationErr != nil {
+		logger.Error().Err(streamValidationErr).Int("id", regID).Interface("extensions.sync.registries[id]",
+			regCfg).Msg("invalid config for streaming")
+
+		return streamValidationErr
+	}
+
 	if intervalValidationErr := validateRegistryManifestCheckInterval(regCfg); intervalValidationErr != nil {
 		logger.Error().Err(intervalValidationErr).Int("id", regID).Interface("extensions.sync.registries[id]",
 			regCfg).Msg("invalid config for manifestCheckInterval")

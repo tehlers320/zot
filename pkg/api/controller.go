@@ -17,6 +17,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/gorilla/securecookie"
+	"github.com/regclient/regclient/types/manifest"
 	"github.com/zitadel/oidc/v3/pkg/client/rp"
 
 	"zotregistry.dev/zot/v2/errors"
@@ -25,6 +26,7 @@ import (
 	ext "zotregistry.dev/zot/v2/pkg/extensions"
 	events "zotregistry.dev/zot/v2/pkg/extensions/events"
 	monitoring "zotregistry.dev/zot/v2/pkg/extensions/monitoring"
+	"zotregistry.dev/zot/v2/pkg/extensions/sync"
 	log "zotregistry.dev/zot/v2/pkg/log"
 	meta "zotregistry.dev/zot/v2/pkg/meta"
 	mTypes "zotregistry.dev/zot/v2/pkg/meta/types"
@@ -667,4 +669,7 @@ type SyncOnDemand interface {
 	SyncImage(ctx context.Context, repo, reference string) error
 	SyncReferrers(ctx context.Context, repo string, subjectDigestStr string, referenceTypes []string) error
 	ShouldCheckUpstreamManifest(repo, reference string) bool
+	FetchManifestForStream(ctx context.Context, repo, reference string) (manifest.Manifest, error)
+	StreamManager() sync.StreamManager
+	IsStreamingEnabledForRepo(repo string) bool
 }

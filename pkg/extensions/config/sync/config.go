@@ -101,6 +101,8 @@ type RegistryConfig struct {
 	// exists to avoid, since concurrent HTTP/1.1 connections beyond 2 would get closed instead of
 	// pooled.
 	MaxIdleConnsPerHost *int
+	// Stream is set to true when it is desired to stream blobs to clients as they are being synced from this upstream.
+	Stream *bool
 }
 
 // OAuth2HelperConfig holds the options used by the "oauth2" credential helper,
@@ -222,6 +224,11 @@ func (config *OAuth2HelperConfig) Validate() error {
 // Default is true when SyncLegacyCosignTags is unset (nil).
 func (r RegistryConfig) ShouldSyncLegacyCosignTags() bool {
 	return r.SyncLegacyCosignTags == nil || *r.SyncLegacyCosignTags
+}
+
+// IsStreamEnabled returns true if streaming is enabled for this registry config.
+func (r RegistryConfig) IsStreamEnabled() bool {
+	return r.Stream != nil && *r.Stream
 }
 
 type Content struct {

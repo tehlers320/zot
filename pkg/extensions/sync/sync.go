@@ -9,6 +9,7 @@ import (
 	"time"
 
 	godigest "github.com/opencontainers/go-digest"
+	"github.com/regclient/regclient/types/manifest"
 	"github.com/regclient/regclient/types/ref"
 
 	syncconf "zotregistry.dev/zot/v2/pkg/extensions/config/sync"
@@ -39,6 +40,10 @@ type Service interface {
 	// Returns whether an upstream manifest check is due for repo:reference.
 	// Always true unless manifestCheckInterval is configured and a recent check succeeded.
 	ShouldCheckUpstream(repo, reference string) bool
+
+	FetchManifest(ctx context.Context, repo, reference string) (manifest.Manifest, []manifest.Manifest, error)
+	// Returns whether streaming is enabled for the given local repo on this service.
+	IsStreamingForRepo(repo string) bool
 }
 
 // Registry interface must be implemented by local and remote registries.

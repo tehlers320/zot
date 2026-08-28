@@ -2,7 +2,11 @@
 
 package sync
 
-import "context"
+import (
+	"context"
+
+	"github.com/regclient/regclient/types/manifest"
+)
 
 type BaseOnDemand struct{}
 
@@ -18,4 +22,18 @@ func (onDemand *BaseOnDemand) SyncReferrers(ctx context.Context, repo string,
 
 func (onDemand *BaseOnDemand) ShouldCheckUpstreamManifest(repo, reference string) bool {
 	return true
+}
+
+func (onDemand *BaseOnDemand) FetchManifestForStream(
+	ctx context.Context, repo, reference string,
+) (manifest.Manifest, error) {
+	return manifest.New()
+}
+
+func (onDemand *BaseOnDemand) StreamManager() StreamManager {
+	return nil
+}
+
+func (onDemand *BaseOnDemand) IsStreamingEnabledForRepo(_ string) bool {
+	return false
 }
