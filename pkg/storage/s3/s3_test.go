@@ -3997,6 +3997,104 @@ func TestS3DedupeZeroSizeBlob(t *testing.T) {
 	})
 }
 
+func TestS3DedupeEmptyCanonicalRecovery(t *testing.T) {
+	testDir := "/oci-repo-test/dedupe-empty-canonical"
+	content := []byte("non-empty-blob-content")
+	digest := godigest.FromBytes(content)
+	canonicalPath := testDir + "/canonical/blobs/sha256/" + digest.Encoded()
+	duplicatePath := testDir + "/duplicate/blobs/sha256/" + digest.Encoded()
+
+	Convey("Dedupe rebuild stops before linking from an empty canonical blob", t, func() {
+		linkCalled := false
+		imgStore := createMockStorageWithMockCache(testDir, &mocks.StorageDriverMock{
+			StatFn: func(_ context.Context, path string) (driver.FileInfo, error) {
+				size := int64(0)
+				if path == duplicatePath {
+					size = int64(len(content))
+				}
+
+				return &mocks.FileInfoMock{
+					PathFn: func() string { return path },
+					SizeFn: func() int64 { return size },
+				}, nil
+			},
+			PutContentFn: func(_ context.Context, _ string, _ []byte) error {
+				linkCalled = true
+
+				return nil
+			},
+		}, &mocks.CacheMock{
+			GetBlobFn: func(godigest.Digest) (string, error) {
+				return canonicalPath, nil
+			},
+		})
+
+		err := imgStore.RunDedupeForDigest(context.Background(), digest, true,
+			[]string{canonicalPath, duplicatePath})
+		So(errors.Is(err, zerr.ErrDedupeRebuild), ShouldBeTrue)
+		So(linkCalled, ShouldBeFalse)
+	})
+
+	Convey("Verified upload repairs the empty canonical blob before linking", t, func() {
+		uploadPath := testDir + "/uploads/new-blob"
+		destinationPath := testDir + "/new-repo/blobs/sha256/" + digest.Encoded()
+		sizes := map[string]int64{
+			canonicalPath: 0,
+			uploadPath:    int64(len(content)),
+		}
+		movedSource := ""
+		movedDestination := ""
+		linkedDestination := ""
+		cachedPath := ""
+
+		imgStore := createMockStorageWithMockCache(testDir, &mocks.StorageDriverMock{
+			StatFn: func(_ context.Context, path string) (driver.FileInfo, error) {
+				size, ok := sizes[path]
+				if !ok {
+					return nil, driver.PathNotFoundError{Path: path}
+				}
+
+				return &mocks.FileInfoMock{
+					PathFn: func() string { return path },
+					SizeFn: func() int64 { return size },
+				}, nil
+			},
+			MoveFn: func(_ context.Context, sourcePath, destPath string) error {
+				movedSource = sourcePath
+				movedDestination = destPath
+				sizes[destPath] = sizes[sourcePath]
+				delete(sizes, sourcePath)
+
+				return nil
+			},
+			PutContentFn: func(_ context.Context, path string, content []byte) error {
+				linkedDestination = path
+				sizes[path] = int64(len(content))
+
+				return nil
+			},
+		}, &mocks.CacheMock{
+			GetBlobFn: func(godigest.Digest) (string, error) {
+				return canonicalPath, nil
+			},
+			PutBlobFn: func(_ godigest.Digest, path string) error {
+				cachedPath = path
+
+				return nil
+			},
+		})
+
+		err := imgStore.DedupeBlob(uploadPath, digest, "new-repo", destinationPath)
+		So(err, ShouldBeNil)
+		So(movedSource, ShouldEqual, uploadPath)
+		So(movedDestination, ShouldEqual, canonicalPath)
+		So(sizes[canonicalPath], ShouldEqual, int64(len(content)))
+		So(linkedDestination, ShouldEqual, destinationPath)
+		So(sizes[destinationPath], ShouldEqual, int64(0))
+		So(cachedPath, ShouldEqual, destinationPath)
+	})
+}
+
 func TestInjectDedupe(t *testing.T) {
 	tdir := t.TempDir()
 

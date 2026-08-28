@@ -1326,6 +1326,36 @@ func (is *ImageStore) DedupeBlob(src string, dstDigest godigest.Digest, dstRepo 
 			continue
 		}
 
+		if blobInfo.Size() == 0 && dstDigest.Algorithm().FromBytes(nil) != dstDigest {
+			is.log.Warn().Str("blobPath", dstRecord).Str("digest", dstDigest.String()).
+				Str("component", "dedupe").Msg("repairing empty canonical blob")
+
+			if err := is.storeDriver.Move(src, dstRecord); err != nil {
+				is.log.Error().Err(err).Str("src", src).Str("dst", dstRecord).Str("component", "dedupe").
+					Msg("failed to repair empty canonical blob")
+
+				return err
+			}
+
+			if !is.storeDriver.SameFile(dst, dstRecord) {
+				if err := is.storeDriver.Link(dstRecord, dst); err != nil {
+					is.log.Error().Err(err).Str("blobPath", dstRecord).Str("component", "dedupe").
+						Msg("failed to link repaired blob")
+
+					return err
+				}
+
+				if err := is.cache.PutBlob(dstDigest, dst); err != nil {
+					is.log.Error().Err(err).Str("blobPath", dst).Str("component", "dedupe").
+						Msg("failed to insert repaired blob record")
+
+					return err
+				}
+			}
+
+			return nil
+		}
+
 		// prevent overwrite original blob
 		if !is.storeDriver.SameFile(dst, dstRecord) {
 			if err := is.storeDriver.Link(dstRecord, dst); err != nil {
@@ -1584,7 +1614,8 @@ func (is *ImageStore) checkCacheBlob(digest godigest.Digest) (string, error) {
 		dstRecord = path.Join(is.rootDir, dstRecord)
 	}
 
-	if _, err := is.storeDriver.Stat(dstRecord); err != nil {
+	binfo, err := is.storeDriver.Stat(dstRecord)
+	if err != nil {
 		is.log.Error().Err(err).Str("blob", dstRecord).Msg("failed to stat blob")
 
 		// the actual blob on disk may have been removed by GC, so sync the cache
@@ -1596,6 +1627,13 @@ func (is *ImageStore) checkCacheBlob(digest godigest.Digest) (string, error) {
 		}
 
 		return "", zerr.ErrBlobNotFound
+	}
+
+	if binfo.Size() == 0 && digest.Algorithm().FromBytes(nil) != digest {
+		is.log.Error().Err(zerr.ErrDedupeRebuild).Str("digest", digest.String()).
+			Str("blob", dstRecord).Str("component", "dedupe").Msg("cached canonical blob has no content")
+
+		return "", zerr.ErrDedupeRebuild
 	}
 
 	is.log.Debug().Str("digest", digest.String()).Str("dstRecord", dstRecord).Str("component", "cache").
