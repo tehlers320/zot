@@ -10,6 +10,7 @@ import (
 
 	godigest "github.com/opencontainers/go-digest"
 	"github.com/regclient/regclient/types/descriptor"
+	rcDocker2 "github.com/regclient/regclient/types/docker/schema2"
 	rcManifest "github.com/regclient/regclient/types/manifest"
 	rcOCIV1 "github.com/regclient/regclient/types/oci/v1"
 	. "github.com/smartystreets/goconvey/convey"
@@ -69,6 +70,33 @@ func newTestOCIManifestWithBlobs(t *testing.T, configData, layerData []byte) rcM
 	return m
 }
 
+func newTestDockerManifestWithBlobs(t *testing.T, configData, layerData []byte) rcManifest.Manifest {
+	t.Helper()
+
+	origMan := rcDocker2.Manifest{
+		Versioned: rcDocker2.ManifestSchemaVersion,
+		Config: descriptor.Descriptor{
+			MediaType: "application/vnd.docker.container.image.v1+json",
+			Digest:    godigest.FromBytes(configData),
+			Size:      int64(len(configData)),
+		},
+		Layers: []descriptor.Descriptor{
+			{
+				MediaType: "application/vnd.docker.image.rootfs.diff.tar.gzip",
+				Digest:    godigest.FromBytes(layerData),
+				Size:      int64(len(layerData)),
+			},
+		},
+	}
+
+	m, err := rcManifest.New(rcManifest.WithOrig(origMan))
+	if err != nil {
+		t.Fatalf("failed to create test Docker manifest: %v", err)
+	}
+
+	return m
+}
+
 // newTestOCIImageIndex creates an OCI Image Index containing multiple platform-specific manifests.
 // Each sub-manifest has a config blob and layer blobs with the provided data.
 func newTestOCIImageIndex(t *testing.T, subManifests []rcManifest.Manifest) rcManifest.Manifest {
@@ -90,6 +118,27 @@ func newTestOCIImageIndex(t *testing.T, subManifests []rcManifest.Manifest) rcMa
 	}
 
 	return idx
+}
+
+func newTestDockerManifestList(t *testing.T, subManifests []rcManifest.Manifest) rcManifest.Manifest {
+	t.Helper()
+
+	manifestDescs := make([]descriptor.Descriptor, len(subManifests))
+	for i, m := range subManifests {
+		manifestDescs[i] = m.GetDescriptor()
+	}
+
+	origList := rcDocker2.ManifestList{
+		Versioned: rcDocker2.ManifestListSchemaVersion,
+		Manifests: manifestDescs,
+	}
+
+	manifestList, err := rcManifest.New(rcManifest.WithOrig(origList))
+	if err != nil {
+		t.Fatalf("failed to create test Docker manifest list: %v", err)
+	}
+
+	return manifestList
 }
 
 func TestChunkingStreamManagerConnectClient(t *testing.T) {
@@ -242,6 +291,24 @@ func TestChunkingStreamManagerStoreImageForStreaming(t *testing.T) {
 			streamableManifest := NewStreamableManifest(manifest, nil)
 			err := sm.StoreImageForStreaming("myrepo", "v1.0", streamableManifest)
 			So(err, ShouldNotBeNil)
+
+			_, ok := sm.StreamingImageManifest("myrepo", "v1.0")
+			So(ok, ShouldBeFalse)
+		})
+
+		Convey("stores Docker schema 2 manifests", func() {
+			dockerManifest := newTestDockerManifestWithBlobs(t, configData, layerData)
+			streamableManifest := NewStreamableManifest(dockerManifest, nil)
+
+			err := sm.StoreImageForStreaming("docker-repo", "v2", streamableManifest)
+			So(err, ShouldBeNil)
+
+			_, ok := sm.StreamingImageManifest("docker-repo", "v2")
+			So(ok, ShouldBeTrue)
+
+			sm.RemoveStreamingImage("docker-repo", "v2")
+			_, ok = sm.StreamingImageManifest("docker-repo", "v2")
+			So(ok, ShouldBeFalse)
 		})
 	})
 }
@@ -397,5 +464,31 @@ func TestChunkingStreamManagerMultiArchStoreImageForStreaming(t *testing.T) {
 			err := sm.StoreImageForStreaming("multi-arch-repo", "latest", streamableManifest)
 			So(err, ShouldNotBeNil)
 		})
+	})
+}
+
+func TestChunkingStreamManagerDockerManifestList(t *testing.T) {
+	Convey("StoreImageForStreaming with Docker manifest list", t, func() {
+		sm := newTestChunkingStreamManager(t.TempDir())
+		amd64Manifest := newTestDockerManifestWithBlobs(t, []byte("amd64-config"), []byte("amd64-layer"))
+		arm64Manifest := newTestDockerManifestWithBlobs(t, []byte("arm64-config"), []byte("arm64-layer"))
+		subManifests := []rcManifest.Manifest{amd64Manifest, arm64Manifest}
+		manifestList := newTestDockerManifestList(t, subManifests)
+
+		streamableManifest := NewStreamableManifest(manifestList, subManifests)
+		err := sm.StoreImageForStreaming("docker-multi-arch", "latest", streamableManifest)
+		So(err, ShouldBeNil)
+
+		_, ok := sm.StreamingImageManifest("docker-multi-arch", "latest")
+		So(ok, ShouldBeTrue)
+
+		for _, subManifest := range subManifests {
+			_, ok := sm.activeStreams[subManifest.GetDescriptor().Digest.String()]
+			So(ok, ShouldBeTrue)
+		}
+
+		sm.RemoveStreamingImage("docker-multi-arch", "latest")
+		_, ok = sm.StreamingImageManifest("docker-multi-arch", "latest")
+		So(ok, ShouldBeFalse)
 	})
 }
