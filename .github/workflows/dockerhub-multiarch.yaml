@@ -55,6 +55,7 @@ jobs:
           docker buildx build \
             --platform linux/${{ matrix.arch }} \
             --file build/Dockerfile \
+            --build-arg GO_IMAGE=golang:1.26 \
             --build-arg COMMIT="${GITHUB_SHA}" \
             --provenance=false \
             --tag "${IMAGE}:${GITHUB_SHA}-${{ matrix.arch }}" \

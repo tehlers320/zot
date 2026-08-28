@@ -7,11 +7,12 @@
 # Podman: Error: determining starting point for build: no FROM statement found
 # ---
 ARG BASE_IMAGE=gcr.io/distroless/base-nossl-debian13:latest
+ARG GO_IMAGE=ghcr.io/project-zot/golang:1.26
 
 # ---
 # Stage 1: Install certs, build binary, create default config file
 # ---
-FROM --platform=$BUILDPLATFORM ghcr.io/project-zot/golang:1.26 AS builder
+FROM --platform=$BUILDPLATFORM $GO_IMAGE AS builder
 
 ARG TARGETOS
 ARG TARGETARCH
