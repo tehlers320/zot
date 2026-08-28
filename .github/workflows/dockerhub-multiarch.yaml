@@ -20,9 +20,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  publish:
-    name: Build and publish amd64/arm64
+  build:
+    name: Build ${{ matrix.arch }}
     runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - amd64
+          - arm64
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -37,24 +43,44 @@ jobs:
 
       - name: Create multi-architecture builder
         run: |
-          docker buildx create --driver docker-container --name zot-multiarch --use
+          docker buildx create --driver docker-container --name zot-${{ matrix.arch }} --use
           docker buildx inspect --bootstrap
 
-      - name: Build and publish image
+      - name: Build and publish architecture image
+        env:
+          IMAGE: docker.io/tehlersexpedia/zot-fork
+        run: |
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            --file build/Dockerfile \
+            --build-arg COMMIT="${GITHUB_SHA}" \
+            --provenance=false \
+            --tag "${IMAGE}:${GITHUB_SHA}-${{ matrix.arch }}" \
+            --push \
+            .
+
+  publish:
+    name: Publish multi-architecture manifest
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: tehlersexpedia
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Merge architecture images
         env:
           IMAGE: docker.io/tehlersexpedia/zot-fork
           IMAGE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || 'blob-streaming' }}
         run: |
           short_sha="${GITHUB_SHA:0:12}"
-          docker buildx build \
-            --platform linux/amd64,linux/arm64 \
-            --file build/Dockerfile \
-            --build-arg COMMIT="${GITHUB_SHA}" \
-            --provenance=false \
+          docker buildx imagetools create \
             --tag "${IMAGE}:${IMAGE_TAG}" \
             --tag "${IMAGE}:sha-${short_sha}" \
-            --push \
-            .
+            "${IMAGE}:${GITHUB_SHA}-amd64" \
+            "${IMAGE}:${GITHUB_SHA}-arm64"
 
       - name: Verify published platforms
         env:
