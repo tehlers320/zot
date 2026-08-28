@@ -3234,6 +3234,68 @@ func (s *mockPrioritizerService) PrefetchManifestBlobsForStream(repo string, mfs
 }
 
 var _ streamPrioritizer = (*BaseService)(nil)
+var _ streamBlobOpener = (*BaseService)(nil)
+
+type mockBlobOpenerService struct {
+	mockSyncService
+	openBlobFn func(ctx context.Context, repo string, digest godigest.Digest) (io.ReadCloser, int64, error)
+}
+
+func (s *mockBlobOpenerService) OpenBlobForStream(ctx context.Context, repo string,
+	digest godigest.Digest,
+) (io.ReadCloser, int64, error) {
+	return s.openBlobFn(ctx, repo, digest)
+}
+
+func TestOnDemandOpenBlobForStream(t *testing.T) {
+	Convey("opens a blob through the streaming service for the requested repo", t, func() {
+		const blobData = "cross-pod blob"
+
+		digest := godigest.FromBytes([]byte(blobData))
+		onDemand := NewOnDemand(log.NewTestLogger())
+		onDemand.Add(&mockBlobOpenerService{
+			mockSyncService: mockSyncService{
+				isStreamingForRepoFn: func(repo string) bool { return repo == "served/repo" },
+			},
+			openBlobFn: func(_ context.Context, repo string,
+				gotDigest godigest.Digest,
+			) (io.ReadCloser, int64, error) {
+				So(repo, ShouldEqual, "served/repo")
+				So(gotDigest, ShouldEqual, digest)
+
+				return io.NopCloser(strings.NewReader(blobData)), int64(len(blobData)), nil
+			},
+		})
+
+		reader, size, err := onDemand.OpenBlobForStream(context.Background(), "served/repo", digest)
+		So(err, ShouldBeNil)
+		So(size, ShouldEqual, int64(len(blobData)))
+
+		content, err := io.ReadAll(reader)
+		So(err, ShouldBeNil)
+		So(reader.Close(), ShouldBeNil)
+		So(string(content), ShouldEqual, blobData)
+	})
+
+	Convey("returns not found when no streaming service covers the repo", t, func() {
+		onDemand := NewOnDemand(log.NewTestLogger())
+		onDemand.Add(&mockBlobOpenerService{
+			mockSyncService: mockSyncService{
+				isStreamingForRepoFn: func(_ string) bool { return false },
+			},
+			openBlobFn: func(_ context.Context, _ string,
+				_ godigest.Digest,
+			) (io.ReadCloser, int64, error) {
+				t.Fatal("unexpected upstream open")
+
+				return nil, 0, nil
+			},
+		})
+
+		_, _, err := onDemand.OpenBlobForStream(context.Background(), "other/repo", godigest.FromString("blob"))
+		So(errors.Is(err, zerr.ErrBlobNotFound), ShouldBeTrue)
+	})
+}
 
 func TestOnDemandConnectBlobStreamPrioritizesBlob(t *testing.T) {
 	testDigest := godigest.FromString("some blob")

@@ -40,6 +40,9 @@ type syncStreamer interface {
 	// active stream. It also prioritizes the blob's upstream download, since a
 	// client is now waiting on it.
 	ConnectBlobStream(repo, blobDigest string, writer io.Writer) (func(ctx context.Context, start, end int64) error, error)
+	// OpenBlobForStream opens a blob directly from the configured upstream.
+	// This is used when another replica owns the process-local stream.
+	OpenBlobForStream(ctx context.Context, repo string, digest godigest.Digest) (io.ReadCloser, int64, error)
 }
 
 // streamer returns the syncStreamer when streaming sync is available and
@@ -131,7 +134,69 @@ func (rh *RouteHandler) tryServeStreamedBlob(response http.ResponseWriter, reque
 
 	// The stream may have completed and committed the blob to storage between
 	// the caller's original storage lookup and the stream lookup above.
-	return rh.serveBlobFromStoreRetry(response, request, imgStore, name, digest, contentRange, rangeHeaderPresent)
+	if rh.serveBlobFromStoreRetry(response, request, imgStore, name, digest, contentRange, rangeHeaderPresent) {
+		return true
+	}
+
+	// activeStreams and the stream temp file are intentionally process-local.
+	// If another replica served the manifest, this pod has neither, and the
+	// shared store will not contain the blob until that replica commits it.
+	// Fetch the content-addressed blob directly from upstream instead of
+	// returning a transient BLOB_UNKNOWN.
+	return rh.tryProxyUpstreamBlob(streamer, response, request, name, digest, contentRange, rangeHeaderPresent)
+}
+
+func (rh *RouteHandler) tryProxyUpstreamBlob(streamer syncStreamer, response http.ResponseWriter,
+	request *http.Request, name string, digest godigest.Digest, contentRange string, rangeHeaderPresent bool,
+) bool {
+	reader, blobSize, err := streamer.OpenBlobForStream(request.Context(), name, digest)
+	if err != nil {
+		rh.c.Log.Debug().Err(err).Str("repo", name).Str("digest", digest.String()).
+			Msg("blob not available from streaming upstream")
+
+		return false
+	}
+	defer reader.Close()
+
+	if blobSize <= 0 {
+		rh.c.Log.Warn().Int64("size", blobSize).Str("repo", name).Str("digest", digest.String()).
+			Msg("streaming upstream returned invalid blob size")
+
+		return false
+	}
+
+	start, end := int64(0), blobSize-1
+	status := http.StatusOK
+
+	if rangeHeaderPresent {
+		ranges, rangeErr := parseRangeHeader(contentRange, blobSize)
+		if rangeErr != nil || len(ranges) != 1 {
+			response.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", blobSize))
+			response.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+
+			return true
+		}
+
+		start, end = ranges[0].start, ranges[0].end
+		if start > 0 {
+			if _, err := io.CopyN(io.Discard, reader, start); err != nil {
+				rh.c.Log.Error().Err(err).Str("digest", digest.String()).
+					Msg("failed to seek upstream blob to requested range")
+
+				return false
+			}
+		}
+
+		status = http.StatusPartialContent
+		response.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, blobSize))
+	}
+
+	length := end - start + 1
+	response.Header().Set(constants.DistContentDigestKey, digest.String())
+	response.Header().Set("Accept-Ranges", "bytes")
+	WriteDataFromReader(response, status, length, constants.BinaryMediaType, io.LimitReader(reader, length), rh.c.Log)
+
+	return true
 }
 
 // tryStreamBlob attempts to serve a blob (fully, or a single byte range) from

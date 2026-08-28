@@ -39,6 +39,7 @@ type mockSyncOnDemand struct {
 	fetchManifestForStreamFn      func(ctx context.Context, name, reference string) ([]byte, godigest.Digest, string, error)
 	cachedBlobInfoFn              func(digest string) (int64, string, error)
 	connectBlobStreamFn           func(repo, digest string, writer io.Writer) (func(ctx context.Context, start, end int64) error, error)
+	openBlobForStreamFn           func(ctx context.Context, repo string, digest godigest.Digest) (io.ReadCloser, int64, error)
 	shouldCheckUpstreamManifestFn func(repo, reference string) bool
 	syncImageFn                   func(ctx context.Context, repo, reference string) error
 }
@@ -96,6 +97,16 @@ func (m *mockSyncOnDemand) ConnectBlobStream(repo, digest string, writer io.Writ
 	}
 
 	return nil, zerr.ErrBlobNotFoundInActiveStreams
+}
+
+func (m *mockSyncOnDemand) OpenBlobForStream(ctx context.Context, repo string,
+	digest godigest.Digest,
+) (io.ReadCloser, int64, error) {
+	if m.openBlobForStreamFn != nil {
+		return m.openBlobForStreamFn(ctx, repo, digest)
+	}
+
+	return nil, 0, zerr.ErrBlobNotFound
 }
 
 func newStreamingBlobTestRouteHandler(
@@ -506,6 +517,95 @@ func TestGetBlobStreaming(t *testing.T) {
 			respBody, readErr := io.ReadAll(resp.Body)
 			So(readErr, ShouldBeNil)
 			So(string(respBody), ShouldEqual, blobData)
+		})
+
+		Convey("proxies from upstream when another pod owns the active stream", func() {
+			const blobData = "cross-pod streaming fallback"
+
+			blobDigest := godigest.FromBytes([]byte(blobData))
+			openCalls := 0
+
+			syncOnDemand := &mockSyncOnDemand{
+				isStreamingEnabledForRepoFn: func(_ string) bool { return true },
+				// CachedBlobInfo intentionally uses its default miss. This models a
+				// second pod whose process-local stream manager never saw the manifest.
+				openBlobForStreamFn: func(_ context.Context, repo string,
+					digest godigest.Digest,
+				) (io.ReadCloser, int64, error) {
+					openCalls++
+					So(repo, ShouldEqual, "test")
+					So(digest, ShouldEqual, blobDigest)
+
+					return io.NopCloser(strings.NewReader(blobData)), int64(len(blobData)), nil
+				},
+			}
+			handler := newStreamingBlobTestRouteHandler(t, mocks.MockedImageStore{
+				GetBlobFn: func(_ string, _ godigest.Digest, _ string) (io.ReadCloser, int64, error) {
+					return nil, 0, zerr.ErrBlobNotFound
+				},
+			}, syncOnDemand)
+
+			req := httptest.NewRequestWithContext(
+				context.Background(), http.MethodGet,
+				"http://example.com/v2/test/blobs/"+blobDigest.String(), http.NoBody,
+			)
+			req = mux.SetURLVars(req, map[string]string{"name": "test", "digest": blobDigest.String()})
+
+			rec := httptest.NewRecorder()
+			handler.GetBlob(rec, req)
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			So(resp.StatusCode, ShouldEqual, http.StatusOK)
+			So(resp.Header.Get("Content-Length"), ShouldEqual, strconv.Itoa(len(blobData)))
+			So(resp.Header.Get(constants.DistContentDigestKey), ShouldEqual, blobDigest.String())
+			So(resp.Header.Get("Content-Type"), ShouldEqual, constants.BinaryMediaType)
+			So(openCalls, ShouldEqual, 1)
+
+			respBody, readErr := io.ReadAll(resp.Body)
+			So(readErr, ShouldBeNil)
+			So(string(respBody), ShouldEqual, blobData)
+		})
+
+		Convey("supports a resumed range through the cross-pod upstream fallback", func() {
+			const blobData = "0123456789"
+
+			blobDigest := godigest.FromBytes([]byte(blobData))
+			syncOnDemand := &mockSyncOnDemand{
+				isStreamingEnabledForRepoFn: func(_ string) bool { return true },
+				openBlobForStreamFn: func(_ context.Context, _ string,
+					_ godigest.Digest,
+				) (io.ReadCloser, int64, error) {
+					return io.NopCloser(strings.NewReader(blobData)), int64(len(blobData)), nil
+				},
+			}
+			handler := newStreamingBlobTestRouteHandler(t, mocks.MockedImageStore{
+				CheckBlobFn: func(_ context.Context, _ string, _ godigest.Digest) (bool, int64, error) {
+					return false, 0, nil
+				},
+			}, syncOnDemand)
+
+			req := httptest.NewRequestWithContext(
+				context.Background(), http.MethodGet,
+				"http://example.com/v2/test/blobs/"+blobDigest.String(), http.NoBody,
+			)
+			req.Header.Set("Range", "bytes=4-7")
+			req = mux.SetURLVars(req, map[string]string{"name": "test", "digest": blobDigest.String()})
+
+			rec := httptest.NewRecorder()
+			handler.GetBlob(rec, req)
+
+			resp := rec.Result()
+			defer resp.Body.Close()
+
+			So(resp.StatusCode, ShouldEqual, http.StatusPartialContent)
+			So(resp.Header.Get("Content-Range"), ShouldEqual, "bytes 4-7/10")
+			So(resp.Header.Get("Content-Length"), ShouldEqual, "4")
+
+			respBody, readErr := io.ReadAll(resp.Body)
+			So(readErr, ShouldBeNil)
+			So(string(respBody), ShouldEqual, "4567")
 		})
 	})
 }

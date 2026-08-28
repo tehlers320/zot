@@ -82,6 +82,44 @@ type streamRepoInitializer interface {
 	EnsureLocalRepo(ctx context.Context, repo string) error
 }
 
+// streamBlobOpener is implemented by streaming services that can open a blob
+// directly from their upstream. It lets a replica recover when a manifest was
+// served by another pod and the blob has not reached shared storage yet.
+type streamBlobOpener interface {
+	OpenBlobForStream(ctx context.Context, repo string, digest godigest.Digest) (io.ReadCloser, int64, error)
+}
+
+// OpenBlobForStream opens a blob from the streaming-enabled upstream serving
+// this repo. Services whose content rules do not cover the repo are skipped.
+func (onDemand *BaseOnDemand) OpenBlobForStream(ctx context.Context, repo string,
+	digest godigest.Digest,
+) (io.ReadCloser, int64, error) {
+	for _, service := range onDemand.services {
+		if !service.IsStreamingForRepo(repo) {
+			continue
+		}
+
+		opener, ok := service.(streamBlobOpener)
+		if !ok {
+			continue
+		}
+
+		reader, size, err := opener.OpenBlobForStream(ctx, repo, digest)
+		if err == nil {
+			return reader, size, nil
+		}
+
+		if errors.Is(err, zerr.ErrSyncImageFilteredOut) {
+			continue
+		}
+
+		onDemand.log.Warn().Err(err).Str("repo", repo).Str("digest", digest.String()).
+			Msg("failed to open blob from streaming upstream")
+	}
+
+	return nil, 0, zerr.ErrBlobNotFound
+}
+
 // streamPrioritizerFor returns the first streaming-enabled service for the
 // repo that supports priority fetching, or nil when there is none.
 func (onDemand *BaseOnDemand) streamPrioritizerFor(repo string) streamPrioritizer {

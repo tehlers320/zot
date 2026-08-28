@@ -4,6 +4,7 @@ package sync
 
 import (
 	"context"
+	"io"
 
 	godigest "github.com/opencontainers/go-digest"
 	"github.com/regclient/regclient/config"
@@ -106,6 +107,20 @@ func (service *BaseService) openPriorityBlob(ctx context.Context, localRepo stri
 
 	// blob.Reader is an alias for *blob.BReader in regclient.
 	return prioClient.BlobGet(ctx, imageRef, desc)
+}
+
+// OpenBlobForStream opens a blob directly from the configured upstream. This
+// is the cross-pod fallback for streaming pulls: another replica can own the
+// in-memory stream while this replica receives the client's blob request.
+func (service *BaseService) OpenBlobForStream(ctx context.Context, localRepo string,
+	digest godigest.Digest,
+) (io.ReadCloser, int64, error) {
+	reader, err := service.openPriorityBlob(ctx, localRepo, descriptor.Descriptor{Digest: digest})
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return reader, reader.GetDescriptor().Size, nil
 }
 
 // PrioritizeBlobForStream starts an out-of-band upstream download for a blob a
