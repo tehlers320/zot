@@ -1,0 +1,63 @@
+name: Publish Docker Hub image
+
+on:
+  push:
+    branches:
+      - blob-streaming
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Docker image tag
+        required: true
+        default: blob-streaming
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dockerhub-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: Build and publish amd64/arm64
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: tehlersexpedia
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create multi-architecture builder
+        run: |
+          docker buildx create --driver docker-container --name zot-multiarch --use
+          docker buildx inspect --bootstrap
+
+      - name: Build and publish image
+        env:
+          IMAGE: docker.io/tehlersexpedia/zot-fork
+          IMAGE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || 'blob-streaming' }}
+        run: |
+          short_sha="${GITHUB_SHA:0:12}"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --file build/Dockerfile \
+            --build-arg COMMIT="${GITHUB_SHA}" \
+            --provenance=false \
+            --tag "${IMAGE}:${IMAGE_TAG}" \
+            --tag "${IMAGE}:sha-${short_sha}" \
+            --push \
+            .
+
+      - name: Verify published platforms
+        env:
+          IMAGE: docker.io/tehlersexpedia/zot-fork
+          IMAGE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || 'blob-streaming' }}
+        run: docker buildx imagetools inspect "${IMAGE}:${IMAGE_TAG}"
